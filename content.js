@@ -5,10 +5,10 @@ function extractChannelId(channelLink) {
         const url = new URL(channelLink.href);
         const path = url.pathname.split("/").filter(Boolean);
         if (path[0] === "channel" && path[1]) {
-            return path[1]; 
+            return path[1];
         }
         if (path[0] && path[0].startsWith("@")) {
-            return path[0]; 
+            return path[0];
         }
         return null;
     } catch (error) {

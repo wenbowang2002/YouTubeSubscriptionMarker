@@ -6,7 +6,9 @@ const CLIENT_ID = config.CLIENT_ID;
 const REDIRECT_URI = `https://${chrome.runtime.id}.chromiumapp.org/`;
 const SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"];
 const TOKEN_KEY = "oauth_token";
-const SEARCH_API_KEY = config.SEARCH_API_KEY; 
+const SEARCH_API_KEY = config.SEARCH_API_KEY;
+
+const ONE_HOUR_MS = 60 * 60 * 1000;
 
 // caches for subscription & handle lookups
 let cache = {};
@@ -205,10 +207,23 @@ async function isUserSubscribed(channelId) {
         }
         channelId = realId;
     }
-    if (cache[channelId] !== undefined) {
-        console.log("already know subscription status for", channelId, ":", cache[channelId]);
-        return cache[channelId];
+
+    let cachedEntry = cache[channelId];
+    if (cachedEntry !== undefined && cachedEntry !== null) {
+        const { status, updatedAt } = cachedEntry;
+
+        if (Date.now() - updatedAt < ONE_HOUR_MS) {
+            console.log(
+                `Using cached subscription status for ${channelId}: ${status}`
+            );
+            return status;
+        } else {
+            console.log(
+                `Cache entry for ${channelId} is older than 24 hours; re-checking.`
+            );
+        }
     }
+
     const token = await getValidToken();
     if (!token) {
         console.log("user not authenticated, cannot check subscription");
@@ -217,7 +232,7 @@ async function isUserSubscribed(channelId) {
     const url = `https://www.googleapis.com/youtube/v3/subscriptions?part=subscriberSnippet&mine=true&forChannelId=${channelId}`;
     console.log("subscription api call for:", channelId, url);
     const resp = await fetch(url, {
-        headers: { "Authorization": `Bearer ${token.access_token}` }
+        headers: { Authorization: `Bearer ${token.access_token}` },
     });
     if (!resp.ok) {
         console.log("non-ok response from subscriptions.list:", resp.status, resp.statusText);
@@ -228,8 +243,14 @@ async function isUserSubscribed(channelId) {
         throw new Error(`api error: ${resp.statusText}`);
     }
     const data = await resp.json();
-    const subscribed = (data.items && data.items.length > 0);
-    cache[channelId] = subscribed;
+    const subscribed = data.items && data.items.length > 0;
+
+    // Save new status + timestamp in the cache
+    cache[channelId] = {
+        status: subscribed,
+        updatedAt: Date.now(),
+    };
+
     await saveCachesToStorage();
     return subscribed;
 }
