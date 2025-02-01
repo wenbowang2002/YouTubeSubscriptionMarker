@@ -32,6 +32,9 @@ chrome.storage.local.get(["subscriptionCache", "handleChannelCache"], data => {
     }
 });
 
+/**
+ * Saves the subscription and handle caches to local storage.
+ */
 async function saveCachesToStorage() {
     return new Promise(resolve => {
         chrome.storage.local.set({
@@ -44,6 +47,9 @@ async function saveCachesToStorage() {
     });
 }
 
+/**
+ * Recursively looks for a key in an object; returns its value if found.
+ */
 function findKeyInObject(obj, keyToFind, validateFn) {
     if (typeof obj !== 'object' || obj === null) return null;
     for (const key in obj) {
@@ -60,6 +66,9 @@ function findKeyInObject(obj, keyToFind, validateFn) {
     return null;
 }
 
+/**
+ * Fetches the OAuth token from local storage.
+ */
 async function getTokenFromStorage() {
     return new Promise(resolve => {
         chrome.storage.local.get([TOKEN_KEY], data => {
@@ -68,6 +77,9 @@ async function getTokenFromStorage() {
     });
 }
 
+/**
+ * Stores the OAuth token into local storage.
+ */
 async function setTokenInStorage(token) {
     return new Promise(resolve => {
         chrome.storage.local.set({ [TOKEN_KEY]: token }, () => {
@@ -76,12 +88,18 @@ async function setTokenInStorage(token) {
     });
 }
 
+/**
+ * Clears the stored OAuth token.
+ */
 async function clearToken() {
     return new Promise(resolve => {
         chrome.storage.local.remove([TOKEN_KEY], () => resolve());
     });
 }
 
+/**
+ * Builds the OAuth authorization URL with optional prompt type.
+ */
 function buildAuthUrl(promptType) {
     const params = new URLSearchParams({
         response_type: "token",
@@ -93,6 +111,9 @@ function buildAuthUrl(promptType) {
     return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
 }
 
+/**
+ * Initiates the OAuth flow to get a token (interactive if requested).
+ */
 async function fetchToken(interactive, promptType) {
     const authUrl = buildAuthUrl(promptType);
     return new Promise((resolve, reject) => {
@@ -113,6 +134,9 @@ async function fetchToken(interactive, promptType) {
     });
 }
 
+/**
+ * Returns a valid OAuth token if one exists in storage and isn't expired.
+ */
 async function getValidToken() {
     const token = await getTokenFromStorage();
     if (token && token.expiry_date > Date.now()) {
@@ -121,85 +145,131 @@ async function getValidToken() {
     return null;
 }
 
-// fallback search using youtube data api
+/**
+ * Uses the YouTube Data API search to find the best match for a channel handle.
+ * Only exact matches on customUrl or channelTitle are accepted to reduce false positives.
+ */
 async function searchForHandleChannelId(handle) {
-    console.log("attempting search fallback for handle:", handle);
     const query = handle.startsWith('@') ? handle.slice(1) : handle;
     const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(query)}&key=${SEARCH_API_KEY}`;
     const resp = await fetch(url);
-    if (!resp.ok) {
-        console.log("non-ok response from search api:", resp.status, resp.statusText);
-        return null;
-    }
+    if (!resp.ok) return null;
+
     const data = await resp.json();
-    if (data.items && data.items.length > 0) {
-        const channelId = data.items[0].id.channelId;
-        console.log("found channelId via search fallback for handle:", handle, channelId);
-        return channelId;
+    if (!data.items || data.items.length === 0) return null;
+
+    const normalizedQuery = query.toLowerCase();
+    let exactMatchId = null;
+
+    for (const item of data.items) {
+        const snippet = item.snippet;
+        const customUrl = snippet.customUrl ? snippet.customUrl.toLowerCase() : "";
+        const channelTitle = snippet.channelTitle ? snippet.channelTitle.toLowerCase() : "";
+
+        if (customUrl === normalizedQuery || channelTitle === normalizedQuery) {
+            exactMatchId = item.id.channelId;
+            break;
+        }
     }
-    console.log("no search results for handle:", handle);
-    return null;
+
+    return exactMatchId || null;
 }
 
+/**
+ * Attempts to resolve any @handle to its corresponding channel ID.
+ */
 async function resolveHandleToChannelId(handle) {
     console.log("attempting to resolve handle:", handle);
+
     if (handleToChannelCache[handle] !== undefined) {
         console.log("returning cached channelId for handle:", handle, handleToChannelCache[handle]);
         return handleToChannelCache[handle];
     }
+
     let rawHandle = handle;
     if (rawHandle.includes('%')) {
         try {
             const part = rawHandle.startsWith('@') ? rawHandle.slice(1) : rawHandle;
             const decodedPart = decodeURIComponent(part);
             rawHandle = rawHandle.startsWith('@') ? '@' + decodedPart : decodedPart;
-        } catch (e) {
+        }
+        catch (e) {
             console.warn("decoding handle failed, using handle as-is:", handle, e);
             rawHandle = handle;
         }
     }
+
     const url = `https://www.youtube.com/${rawHandle}`;
     console.log("fetching handle page at:", url);
     const resp = await fetch(url);
-    if (!resp.ok) {
-        console.log("non-ok response fetching handle page:", resp.status, resp.statusText);
-        return null;
-    }
-    const text = await resp.text();
-    const dataMatch = text.match(/ytInitialData\s*=\s*(\{.*?\});/s);
+
     let channelId = null;
-    if (dataMatch) {
-        try {
-            const jsonData = JSON.parse(dataMatch[1]);
-            if (jsonData.metadata && jsonData.metadata.channelMetadataRenderer && jsonData.metadata.channelMetadataRenderer.channelId) {
-                channelId = jsonData.metadata.channelMetadataRenderer.channelId;
+    if (resp.ok) {
+        const text = await resp.text();
+        const dataMatch = text.match(/ytInitialData\s*=\s*(\{.*?\});/s);
+
+        if (dataMatch) {
+            try {
+                const jsonData = JSON.parse(dataMatch[1]);
+
+                if (
+                    jsonData.metadata &&
+                    jsonData.metadata.channelMetadataRenderer &&
+                    jsonData.metadata.channelMetadataRenderer.channelId
+                ) {
+                    channelId = jsonData.metadata.channelMetadataRenderer.channelId;
+                }
+
+                if (
+                    !channelId &&
+                    jsonData.microformat &&
+                    jsonData.microformat.microformatDataRenderer &&
+                    jsonData.microformat.microformatDataRenderer.urlCanonical
+                ) {
+                    const urlC = jsonData.microformat.microformatDataRenderer.urlCanonical;
+                    const match = urlC.match(/\/channel\/(UC[0-9A-Za-z_-]+)/);
+                    if (match) channelId = match[1];
+                }
+
+                if (!channelId) {
+                    channelId = findKeyInObject(jsonData, "channelId", val => val.startsWith("UC"));
+                }
             }
-            if (!channelId && jsonData.microformat && jsonData.microformat.microformatDataRenderer && jsonData.microformat.microformatDataRenderer.urlCanonical) {
-                const urlC = jsonData.microformat.microformatDataRenderer.urlCanonical;
-                const match = urlC.match(/\/channel\/(UC[0-9A-Za-z_-]+)/);
-                if (match) channelId = match[1];
+            catch (e) {
+                console.error("error parsing ytInitialData:", e);
             }
-            if (!channelId) {
-                channelId = findKeyInObject(jsonData, "channelId", val => val.startsWith("UC"));
-            }
-        } catch (e) {
-            console.error("error parsing ytInitialData:", e);
+        }
+        else {
+            console.log("no ytInitialData found for handle:", rawHandle);
         }
     }
     else {
-        console.log("no ytInitialData in channel page for handle:", rawHandle);
+        console.log("non-ok response fetching handle page:", resp.status, resp.statusText);
     }
+
     if (!channelId) {
-        channelId = await searchForHandleChannelId(handle);
+        console.log("falling back to search for handle:", rawHandle);
+        const fallbackChannelId = await searchForHandleChannelId(rawHandle);
+        if (fallbackChannelId) {
+            channelId = fallbackChannelId;
+        }
+        else {
+            console.warn("Could not resolve handle via fallback search:", rawHandle);
+        }
     }
+
     handleToChannelCache[handle] = channelId || null;
     await saveCachesToStorage();
     console.log("resolved handle:", handle, "to channelId:", channelId);
     return channelId;
 }
 
+/**
+ * Checks if the user is subscribed to a given channel ID (or handle).
+ */
 async function isUserSubscribed(channelId) {
     console.log("checking subscription for channel:", channelId);
+
     if (channelId.startsWith('@')) {
         const realId = await resolveHandleToChannelId(channelId);
         if (!realId) {
@@ -211,16 +281,12 @@ async function isUserSubscribed(channelId) {
     let cachedEntry = cache[channelId];
     if (cachedEntry !== undefined && cachedEntry !== null) {
         const { status, updatedAt } = cachedEntry;
-
         if (Date.now() - updatedAt < ONE_HOUR_MS) {
-            console.log(
-                `Using cached subscription status for ${channelId}: ${status}`
-            );
+            console.log(`Using cached subscription status for ${channelId}: ${status}`);
             return status;
-        } else {
-            console.log(
-                `Cache entry for ${channelId} is older than 24 hours; re-checking.`
-            );
+        }
+        else {
+            console.log(`Cache entry for ${channelId} is older than 1 hour; re-checking.`);
         }
     }
 
@@ -229,8 +295,10 @@ async function isUserSubscribed(channelId) {
         console.log("user not authenticated, cannot check subscription");
         throw new Error("not authenticated");
     }
+
     const url = `https://www.googleapis.com/youtube/v3/subscriptions?part=subscriberSnippet&mine=true&forChannelId=${channelId}`;
     console.log("subscription api call for:", channelId, url);
+
     const resp = await fetch(url, {
         headers: { Authorization: `Bearer ${token.access_token}` },
     });
@@ -242,10 +310,10 @@ async function isUserSubscribed(channelId) {
         }
         throw new Error(`api error: ${resp.statusText}`);
     }
+
     const data = await resp.json();
     const subscribed = data.items && data.items.length > 0;
 
-    // Save new status + timestamp in the cache
     cache[channelId] = {
         status: subscribed,
         updatedAt: Date.now(),
@@ -259,39 +327,55 @@ async function isUserSubscribed(channelId) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "checkChannel") {
         const { channelId } = message;
+
         if (cache[channelId] !== undefined) {
-            sendResponse({ subscribed: cache[channelId], fromCache: true });
+            const cachedEntry = cache[channelId];
+            const isSubscribed = cachedEntry ? cachedEntry.status : false;
+            sendResponse({ subscribed: isSubscribed, fromCache: true });
             return true;
         }
-        isUserSubscribed(channelId).then(subscribed => {
-            sendResponse({ subscribed });
-        }).catch(err => {
-            console.error("error checking subscription:", err.message);
-            if (err.message.includes("not authenticated")) {
-                sendResponse({ notAuthenticated: true });
-            }
-            else {
-                sendResponse({ error: err.message });
-            }
-        });
+
+        isUserSubscribed(channelId)
+            .then(subscribed => {
+                sendResponse({ subscribed });
+            })
+            .catch(err => {
+                console.error("error checking subscription:", err.message);
+                if (err.message.includes("not authenticated")) {
+                    sendResponse({ notAuthenticated: true });
+                }
+                else {
+                    sendResponse({ error: err.message });
+                }
+            });
         return true;
     }
+
     if (message.type === "getCachedStatus") {
         const { channelId } = message;
+
         if (cache[channelId] !== undefined) {
-            sendResponse({ status: cache[channelId] });
+            const cachedEntry = cache[channelId];
+            if (cachedEntry) {
+                sendResponse({ status: cachedEntry.status });
+            }
+            else {
+                sendResponse({ status: false });
+            }
         }
         else {
             sendResponse({});
         }
         return true;
     }
+
     if (message.type === "checkAuth") {
         getValidToken().then(token => {
             sendResponse({ authenticated: !!token });
         });
         return true;
     }
+
     return false;
 });
 
@@ -300,7 +384,8 @@ chrome.action.onClicked.addListener(async () => {
     try {
         await fetchToken(true, "consent");
         console.log("user authenticated successfully!");
-    } catch (e) {
+    }
+    catch (e) {
         console.error("user failed to authenticate:", e);
     }
 });
