@@ -1,44 +1,122 @@
 // content.js
 
 /*
-    Developer notes
+    Module: Content Script
 
-    This script runs in the context of YouTube pages. It never calls network APIs.
-    Its role is to detect channel anchors as the page updates, extract either a UC
-    channelId or an @handle, and ask the background service to determine membership.
+    Purpose
+    Add a checkmark icon next to the channel-name text link on YouTube surfaces when subscribed.
 
-    The selector set intentionally covers multiple surfaces. A guard function is used
-    to avoid placing markers in unintended areas such as subscriber-count elements.
+    Approach
+    Collect candidate anchors across light and shadow DOM, gate to channel-name links only, extract a robust channel
+    reference, batch query the background for membership, and add one icon per passing anchor.
+
+    Quota
+    No direct network calls. All checks are batched through the background worker.
+
+    Logging
+    Structured logger with level control and periodic heartbeats.
+
+    Formatting
+    Four spaces indentation and block comments only.
 */
-
-const DEBUG = true;
-const LOG_PREFIX = "[YTSM/CS]";
 
 /*
-    Bulk and polling configuration
-
-    Bulk messages reduce chatter to the background without delaying the UI.
-    A MutationObserver plus a light polling loop catches SPA updates and lazy loads.
+    Section: Logger
 */
-const BULK_INTERVAL_MS = 1000;
-const MAX_IDS_PER_BULK = 100;
+function makeLogger(prefix, level = "info", heartbeatMs = 2500) {
+    const rank = { error: 0, warn: 1, info: 2, debug: 3 };
+    const min = rank[level] ?? 2;
+    const last = new Map();
+    function emit(tag, args) {
+        const r = rank[tag] ?? 3;
+        if (r > min) return;
+        const fn = console[tag] || console.log;
+        fn(prefix, ...args);
+    }
+    function heartbeat(tag, argsFactory) {
+        const now = Date.now();
+        const prev = last.get(tag) || 0;
+        if (now - prev >= heartbeatMs) {
+            last.set(tag, now);
+            try { emit("info", argsFactory()); } catch {}
+        }
+    }
+    return {
+        error: (...a) => emit("error", a),
+        warn: (...a) => emit("warn", a),
+        info: (...a) => emit("info", a),
+        debug: (...a) => emit("debug", a),
+        heartbeat
+    };
+}
+
+const logger = makeLogger("[YTSM/CS]", "info", 3000);
+
+/*
+    Section: Timing and Queues
+*/
+const BULK_INTERVAL_MS = 800;
+const MAX_IDS_PER_BULK = 200;
+
 let observer = null;
 let pollTimer = null;
-let pendingIds = new Set();
+let pendingRefs = new Set();
 let lastBulkAt = 0;
 
 /*
-    Logging helper guarded by DEBUG
+    Section: Selectors
+
+    Purpose
+    Broad patterns to scoop up channel-name anchors across YouTube surfaces. Gating is applied later.
 */
-function log(...args) {
-    if (DEBUG) console.log(LOG_PREFIX, ...args);
-}
+const SELECTOR_LIST = [
+    'a[href^="/@"]',
+    'a[href^="/channel/UC"]',
+    'a[href^="/c/"]',
+    'a[href^="/user/"]',
+    'a[href^="https://www.youtube.com/@"]',
+    'a[href^="https://www.youtube.com/channel/UC"]',
+    'a[href^="https://www.youtube.com/c/"]',
+    'a[href^="https://www.youtube.com/user/"]',
+    "ytd-channel-name a",
+    "#channel-name a",
+    "ytd-video-owner-renderer #channel-name a",
+    "ytd-video-owner-renderer ytd-channel-name a",
+    "ytd-rich-grid-media #channel-info a",
+    "ytd-rich-item-renderer ytd-channel-name a",
+    "ytd-compact-video-renderer ytd-channel-name a",
+    "ytd-grid-video-renderer ytd-channel-name a",
+    "ytd-search ytd-channel-name a",
+    "ytd-reel-player-overlay-renderer a[href*='/@']",
+    "ytd-mini-channel-renderer a"
+];
 
 /*
-    Safe wrapper around sendMessage
+    Section: Exclusions
 
-    Handles cases where the extension context is not ready or becomes invalidated
-    during YouTube SPA navigations. Always resolves to a response or null.
+    Purpose
+    Containers and text to avoid to prevent false positives on subscribe UI and counts.
+*/
+const EXCLUDE_CONTAINERS = [
+    "#owner-sub-count",
+    "ytd-subscribe-button-renderer",
+    "ytd-sentiment-bar-renderer",
+    "ytd-video-owner-renderer #owner-sub-count"
+];
+
+const EXCLUDE_TEXT_REGEX = /\bsubscribe|subscribers?\b/i;
+
+/*
+    Section: Messaging
+
+    Purpose
+    Guarded bridge to background messaging to avoid context errors.
+
+    Parameters
+    message: any
+
+    Returns
+    Promise<any|null>
 */
 function safeSendMessage(message) {
     return new Promise(resolve => {
@@ -49,59 +127,186 @@ function safeSendMessage(message) {
             chrome.runtime.sendMessage(message, response => {
                 const err = chrome.runtime.lastError;
                 if (err) {
-                    if (DEBUG) console.warn(LOG_PREFIX, "sendMessage error:", err.message, "for", message?.type);
+                    logger.warn("sendMessage error", err.message, message && message.type ? message.type : "");
                     return resolve(null);
                 }
                 resolve(response ?? null);
             });
         } catch (e) {
-            if (DEBUG) console.warn(LOG_PREFIX, "sendMessage threw:", e);
+            logger.warn("sendMessage threw", e && e.message ? e.message : String(e));
             resolve(null);
         }
     });
 }
 
 /*
-    Extract either a UC channelId or a normalized @handle from an anchor element
+    Section: Shadow DOM Traversal
 
-    The function tolerates both absolute and relative hrefs and normalizes handles
-    to lowercase for stable cache keys.
+    Purpose
+    Collect matching anchors across light DOM and open shadow roots.
+
+    Parameters
+    root: Node
+    selectors: string[]
+
+    Returns
+    Element[]
 */
-function extractIdOrHandle(a) {
+function queryAllDeep(root, selectors) {
+    const results = [];
+    const selector = selectors.join(",");
+    const visited = new WeakSet();
+    function scan(node) {
+        try {
+            const found = node.querySelectorAll(selector);
+            for (const el of found) results.push(el);
+        } catch {}
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT, null);
+        let cur = walker.currentNode;
+        while (cur) {
+            const sr = cur.shadowRoot;
+            if (sr && !visited.has(sr)) {
+                visited.add(sr);
+                scan(sr);
+            }
+            cur = walker.nextNode();
+        }
+    }
+    scan(root);
+    return results;
+}
+
+/*
+    Section: Closest Across Shadows
+
+    Purpose
+    Element.closest replacement that climbs out of shadow roots through hosts.
+
+    Parameters
+    startEl: Element
+    selector: string
+
+    Returns
+    Element | null
+*/
+function closestDeep(startEl, selector) {
+    if (!startEl) return null;
+    function matches(el, sel) {
+        try { return el instanceof Element && el.matches(sel); } catch { return false; }
+    }
+    let el = startEl;
+    while (el) {
+        if (matches(el, selector)) return el;
+        let parent = el.parentNode;
+        if (!parent && el.getRootNode) {
+            const rn = el.getRootNode();
+            if (rn && rn instanceof ShadowRoot) parent = rn.host;
+        }
+        if (!parent && el instanceof ShadowRoot) parent = el.host;
+        el = parent;
+    }
+    return null;
+}
+
+/*
+    Section: Gates
+
+    Purpose
+    Validate anchors as channel-name links only.
+
+    Parameters
+    a: HTMLAnchorElement
+
+    Returns
+    boolean
+*/
+function isChannelHref(a) {
+    const href = a.getAttribute("href") || "";
+    if (href.startsWith("/@") || href.startsWith("/channel/UC") || href.startsWith("/c/") || href.startsWith("/user/")) return true;
+    if (/^https:\/\/(www\.|m\.)?youtube\.com\//.test(href)) return true;
+    return false;
+}
+
+function isChannelNameAnchor(a) {
+    if (!isChannelHref(a)) return false;
+    try {
+        if (a.querySelector("img, yt-img-shadow")) return false;
+    } catch {}
+    for (const sel of EXCLUDE_CONTAINERS) {
+        if (closestDeep(a, sel)) return false;
+    }
+    const txt = (a.textContent || "").trim();
+    if (EXCLUDE_TEXT_REGEX.test(txt)) return false;
+    const inOwner = !!closestDeep(a, "ytd-video-owner-renderer");
+    if (inOwner && !closestDeep(a, "ytd-video-owner-renderer #channel-name")) return false;
+    return true;
+}
+
+/*
+    Section: Reference Extraction
+
+    Purpose
+    Extract a robust reference token to send to background. Handles UC ids, @handles, /c names, /user names, and full URLs.
+
+    Parameters
+    a: HTMLAnchorElement
+
+    Returns
+    string | null
+*/
+function extractRef(a) {
     try {
         const raw = (a.getAttribute("href") || "").trim();
         if (!raw) return null;
-
         const mUC = raw.match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
         if (mUC) return mUC[1];
-
         const mAt = raw.match(/\/@([^/?#]+)/);
-        if (mAt) return "@" + mAt[1].toLowerCase();
-
-        const url = new URL(a.href, location.href);
-        const parts = url.pathname.split("/").filter(Boolean);
-        if (parts[0] === "channel" && parts[1]) return parts[1];
-        if (parts[0] && parts[0].startsWith("@")) return "@" + parts[0].slice(1).toLowerCase();
-
-        return null;
+        if (mAt) return "@" + decodeURIComponent(mAt[1].toLowerCase());
+        if (raw.startsWith("/c/") || raw.startsWith("/user/")) return raw;
+        if (/^https?:\/\//i.test(raw)) {
+            try {
+                const u = new URL(raw);
+                if (u.hostname.endsWith("youtube.com")) {
+                    if (/^\/channel\/(UC[0-9A-Za-z_-]{22})/.test(u.pathname)) return u.pathname.split("/")[2];
+                    if (/^\/@/.test(u.pathname)) return "@" + u.pathname.split("/")[1].slice(1).toLowerCase();
+                    if (/^\/c\//.test(u.pathname) || /^\/user\//.test(u.pathname)) return u.pathname;
+                }
+            } catch {}
+            return raw;
+        }
+        try {
+            const abs = new URL(raw, location.href).toString();
+            return abs;
+        } catch {
+            return raw;
+        }
     } catch {
         return null;
     }
 }
 
 /*
-    Insert a checkmark icon adjacent to a channel anchor
+    Section: Marker
 
-    The marker is idempotent per anchor to prevent duplicates during repeated scans.
+    Purpose
+    Append one small icon to the anchor to indicate subscription.
+
+    Parameters
+    a: HTMLAnchorElement
+
+    Returns
+    void
 */
 function addMarker(a) {
     if (a.querySelector(".subscription-marker")) return;
     const img = document.createElement("img");
     try {
-        img.src = chrome.runtime.getURL("icon.png");
-    } catch {
-        return;
-    }
+        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
+            img.src = chrome.runtime.getURL("icon.png");
+        } else {
+            return;
+        }
+    } catch { return; }
     img.className = "subscription-marker";
     img.style.marginLeft = "5px";
     img.style.width = "16px";
@@ -112,165 +317,244 @@ function addMarker(a) {
 }
 
 /*
-    Heuristic gate to ensure we only mark the channel name anchor
+    Section: Scanner
 
-    This prevents adding a marker next to subscriber-count elements or other
-    secondary anchors on the Watch page and similar surfaces.
+    Purpose
+    Traverse DOM and queue references for anchors that pass gates and lack a marker.
+
+    Parameters
+    none
+
+    Returns
+    void
 */
-function isChannelNameAnchor(a) {
-    if (a.closest("#owner-sub-count")) return false;
-    if (/\bsubscribers?\b/i.test(a.textContent || "")) return false;
-
-    if (a.closest("ytd-channel-name")) return true;
-    if (a.closest("#channel-name")) return true;
-
-    return false;
-}
-
-/*
-    Anchor selector set
-
-    This gathers anchors from several common components. Additional selectors
-    can be added as YouTube evolves, while the isChannelNameAnchor gate
-    protects against false positives.
-*/
-function getAnchors() {
-    return document.querySelectorAll([
-        "ytd-channel-name a",
-        "ytd-video-owner-renderer ytd-channel-name a",
-        "ytd-mini-channel-renderer a.yt-simple-endpoint",
-        'a[href^="/@"]',
-        'a[href^="/channel/UC"]'
-    ].join(","));
-}
-
-/*
-    Queue new IDs found on the page
-
-    Each anchor maintains a tiny set of IDs it has already contributed to avoid
-    re-queuing during repeated scans or SPA updates.
-*/
-function queueIdsFromDom() {
-    const anchors = getAnchors();
+function queueRefsFromDom() {
+    const anchors = queryAllDeep(document, SELECTOR_LIST);
+    let seen = 0;
+    let eligible = 0;
+    let extracted = 0;
     let added = 0;
-
     for (const a of anchors) {
+        seen += 1;
         if (!isChannelNameAnchor(a)) continue;
-
-        const id = extractIdOrHandle(a);
-        if (!id) continue;
-
+        eligible += 1;
         if (a.querySelector(".subscription-marker")) continue;
-
-        let list = a.__ytsmIds;
-        if (!list) {
-            list = new Set();
-            Object.defineProperty(a, "__ytsmIds", { value: list, writable: false });
-        }
-        if (!list.has(id)) {
-            list.add(id);
-            pendingIds.add(id);
-            added += 1;
-        }
+        const ref = extractRef(a);
+        if (!ref) continue;
+        extracted += 1;
+        pendingRefs.add(ref);
+        added += 1;
     }
-
-    if (added > 0) log("queued", added, "ids; pending =", pendingIds.size);
-
-    const now = Date.now();
-    if (pendingIds.size && (now - lastBulkAt >= BULK_INTERVAL_MS)) {
+    logger.heartbeat("scan", () => ["scan", "anchors", seen, "eligible", eligible, "extracted", extracted, "queued", added, "pending", pendingRefs.size]);
+    if (pendingRefs.size && Date.now() - lastBulkAt >= BULK_INTERVAL_MS) {
         void flushBulk();
     }
 }
 
 /*
-    Bulk message to background for membership checks
+    Section: Batch Apply
 
-    Results are applied idempotently by scanning anchors again. This tolerates
-    DOM changes that occur while waiting for the background response.
+    Purpose
+    Send a batch to background, then mark passing anchors.
+
+    Parameters
+    none
+
+    Returns
+    Promise<void>
 */
 async function flushBulk() {
-    if (!pendingIds.size) return;
-
+    if (!pendingRefs.size) return;
     const now = Date.now();
     if (now - lastBulkAt < BULK_INTERVAL_MS) return;
     lastBulkAt = now;
-
     const ids = [];
-    for (const id of pendingIds) {
+    for (const id of pendingRefs) {
         ids.push(id);
-        pendingIds.delete(id);
         if (ids.length >= MAX_IDS_PER_BULK) break;
     }
-
-    log("sending bulk check:", ids.length, "ids");
-
+    for (const id of ids) pendingRefs.delete(id);
+    logger.info("bulk request", ids.length);
     let response = null;
     try {
         response = await safeSendMessage({ type: "bulkCheckChannels", ids });
     } catch {
         response = null;
     }
-
     if (!response || !response.results) {
-        log("bulk results missing or null; requeueing ids");
-        for (const id of ids) pendingIds.add(id);
+        logger.warn("bulk response missing; requeueing", ids.length);
+        for (const id of ids) pendingRefs.add(id);
         return;
     }
-
     const results = response.results;
-    log("bulk results received:", Object.keys(results).length, "stale:", response.stale, "syncing:", response.syncing);
-
-    const anchors = getAnchors();
+    const anchors = queryAllDeep(document, SELECTOR_LIST);
+    let marked = 0;
     for (const a of anchors) {
         if (!isChannelNameAnchor(a)) continue;
-        const id = extractIdOrHandle(a);
-        if (!id) continue;
-        if (results[id] === true) addMarker(a);
+        if (a.querySelector(".subscription-marker")) continue;
+        const ref = extractRef(a);
+        if (!ref) continue;
+        if (results[ref] === true) {
+            addMarker(a);
+            marked += 1;
+        }
     }
-
-    if (pendingIds.size) {
+    if (marked > 0) logger.info("markers added", marked);
+    if (pendingRefs.size) {
         setTimeout(flushBulk, BULK_INTERVAL_MS);
     }
 }
 
 /*
-    Lifecycle management
+    Section: Debug Bridge
 
-    Uses a MutationObserver for micro-batch responsiveness and a slow poller
-    as a belt-and-suspenders backup for missed mutations on heavy pages.
+    Purpose
+    Allow page-world scripts and the DevTools console to request a one-off resolve test without direct access to chrome.runtime.
+
+    Invocation
+    window.postMessage({ type: "YTSM_DEBUG_RESOLVE", ref: "/@handle" })
+
+    Response
+    Posts back a message with type "YTSM_DEBUG_RESULT" carrying { ref, norm, resolvedUc, inIndex, final }
+*/
+window.addEventListener("message", evt => {
+    try {
+        const data = evt && evt.data;
+        if (!data) return;
+        if (data.type === "YTSM_DEBUG_RESOLVE") {
+            const ref = String(data.ref || "");
+            safeSendMessage({ type: "debugResolve", ref })
+                .then(result => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", payload: result }, "*"); } catch {} })
+                .catch(err => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+        }
+    } catch {}
+});
+
+/*
+    Section: Debug Identity Bridge
+
+    Purpose
+    Request the current authenticated YouTube channel identity and echo it back to the page console.
+
+    Invocation
+    window.postMessage({ type: "YTSM_WHOAMI" })
+
+    Response
+    YTSM_WHOAMI_RESULT with { ok, identity }
+*/
+window.addEventListener("message", evt => {
+    try {
+        const data = evt && evt.data;
+        if (!data) return;
+        if (data.type === "YTSM_WHOAMI") {
+            safeSendMessage({ type: "whoami" })
+                .then(result => { try { window.postMessage({ type: "YTSM_WHOAMI_RESULT", payload: result }, "*"); } catch {} })
+                .catch(err => { try { window.postMessage({ type: "YTSM_WHOAMI_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+        }
+    } catch {}
+});
+
+/*
+    Section: Debug Account Control
+
+    Purpose
+    Allow logging out and reauth from the page console.
+
+    Invocations
+    window.postMessage({ type: "YTSM_LOGOUT" })
+    window.postMessage({ type: "YTSM_REAUTH" })
+
+    Responses
+    YTSM_LOGOUT_RESULT with { ok }
+    YTSM_REAUTH_RESULT with { ok, total }
+*/
+window.addEventListener("message", evt => {
+    try {
+        const data = evt && evt.data;
+        if (!data) return;
+        if (data.type === "YTSM_LOGOUT") {
+            safeSendMessage({ type: "logout" })
+                .then(result => { try { window.postMessage({ type: "YTSM_LOGOUT_RESULT", payload: result }, "*"); } catch {} })
+                .catch(err => { try { window.postMessage({ type: "YTSM_LOGOUT_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+        }
+        if (data.type === "YTSM_REAUTH") {
+            safeSendMessage({ type: "reauth" })
+                .then(result => { try { window.postMessage({ type: "YTSM_REAUTH_RESULT", payload: result }, "*"); } catch {} })
+                .catch(err => { try { window.postMessage({ type: "YTSM_REAUTH_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+        }
+    } catch {}
+});
+
+/*
+    Section: Debug Invalidate Bridge
+
+    Purpose
+    Allow page-world to invalidate a cached handle/url mapping in the background so the next check re-resolves.
+
+    Invocation
+    window.postMessage({ type: "YTSM_INVALIDATE", ref: "@handle" })
+
+    Response
+    YTSM_INVALIDATE_RESULT with { ok }
+*/
+window.addEventListener("message", evt => {
+    try {
+        const d = evt && evt.data;
+        if (!d || d.type !== "YTSM_INVALIDATE") return;
+        const ref = String(d.ref || "");
+        const key = ref.startsWith("@") || ref.startsWith("/") ? ref : "@" + ref;
+        safeSendMessage({ type: "invalidateHandle", handle: key })
+            .then(r => { try { window.postMessage({ type: "YTSM_INVALIDATE_RESULT", payload: r }, "*"); } catch {} })
+            .catch(e => { try { window.postMessage({ type: "YTSM_INVALIDATE_RESULT", error: e && e.message ? e.message : String(e) }, "*"); } catch {} });
+    } catch {}
+});
+
+/*
+    Section: Hotkey
+
+    Purpose
+    Provide a quick way to test a reference without using the console.
+
+    Hotkey
+    Alt + Shift + Y
+*/
+document.addEventListener("keydown", e => {
+    try {
+        if (e.altKey && e.shiftKey && e.key && e.key.toLowerCase() === "y") {
+            const ref = prompt("YTSM debugResolve: enter channel ref (@handle, /channel/UC..., /c/..., /user/..., or URL):", "/@dttodot");
+            if (!ref) return;
+            safeSendMessage({ type: "debugResolve", ref })
+                .then(result => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", payload: result }, "*"); } catch {} })
+                .catch(err => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+        }
+    } catch {}
+});
+
+/*
+    Section: Lifecycle
+
+    Purpose
+    Start DOM observation and periodic scans. Stop on pagehide and when tab is hidden.
 */
 function start() {
     stop();
-
     observer = new MutationObserver(() => {
-        queueMicrotask(queueIdsFromDom);
+        queueMicrotask(queueRefsFromDom);
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
-
-    pollTimer = setInterval(queueIdsFromDom, 1500);
-
-    queueIdsFromDom();
-
-    chrome.runtime.sendMessage({ type: "refreshSubscriptions" }, () => {});
+    pollTimer = setInterval(queueRefsFromDom, 1500);
+    queueRefsFromDom();
+    lastBulkAt = 0;
+    setTimeout(() => void flushBulk(), 100);
+    void safeSendMessage({ type: "refreshSubscriptions" });
 }
 
 function stop() {
-    if (observer) {
-        observer.disconnect();
-        observer = null;
-    }
-    if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-    }
-    pendingIds.clear();
+    if (observer) { observer.disconnect(); observer = null; }
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    pendingRefs.clear();
 }
 
-/*
-    Handle SPA lifecycle transitions
-
-    These events keep the scanner aligned with page visibility and navigation.
-*/
 window.addEventListener("pagehide", stop, { capture: true });
 window.addEventListener("beforeunload", stop, { capture: true });
 document.addEventListener("visibilitychange", () => {
