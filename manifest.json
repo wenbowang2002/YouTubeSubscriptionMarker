@@ -2,15 +2,16 @@
     "manifest_version": 3,
     "name": "YouTube Subscription Marker",
     "version": "1.0",
-    "description": "Marks subscribed channels with an icon next to the channel name on YouTube Home page, History page, etc.",
+    "description": "Marks subscribed channels with an icon next to the channel name on YouTube surfaces.",
     "permissions": [
         "storage",
-        "identity",
-        "scripting"
+        "identity"
     ],
     "host_permissions": [
-        "https://www.youtube.com/*",
-        "https://www.googleapis.com/*"
+        "https://*.youtube.com/*",
+        "https://consent.youtube.com/*",
+        "https://www.googleapis.com/*",
+        "https://accounts.google.com/*"
     ],
     "background": {
         "service_worker": "background.js",
@@ -19,16 +20,23 @@
     "content_scripts": [
         {
             "matches": [
-                "https://www.youtube.com/*"
+                "https://*.youtube.com/*"
             ],
             "js": [
                 "content.js"
-            ]
+            ],
+            "run_at": "document_idle"
         }
     ],
     "action": {
         "default_icon": "icon.png",
         "default_title": "Click to Authenticate"
+    },
+    "icons": {
+        "16": "icon.png",
+        "32": "icon.png",
+        "48": "icon.png",
+        "128": "icon.png"
     },
     "web_accessible_resources": [
         {
@@ -36,7 +44,7 @@
                 "icon.png"
             ],
             "matches": [
-                "https://www.youtube.com/*"
+                "https://*.youtube.com/*"
             ]
         }
     ]
