@@ -3,31 +3,66 @@
 import config from "./config.js";
 
 /*
-    Configuration
+    Developer notes
+
+    This service worker is the control plane. It owns OAuth, YouTube Data API calls,
+    and all persistent caches. The content script never calls network APIs directly.
+    That separation keeps quota usage predictable and allows central rate limiting.
+
+    Architecture overview
+
+    1) Build a local index of all the user's subscriptions via subscriptions.list (mine=true).
+       This makes most checks O(1) local set lookups instead of API calls.
+    2) While the index is missing or stale, allow a small, rate-limited trickle of
+       per-channel checks so UI remains responsive during cold start.
+    3) Resolve @handles to UC channelIds primarily via HTML parsing of channel pages.
+       This costs zero quota and is resilient to minor markup changes by searching multiple paths.
+    4) If HTML parsing fails, fall back to the YouTube search API under a strict budget.
+    5) Safety net: occasionally re-verify negative results via API to catch rare mismatches.
+
+    All caches persist in chrome.storage.local so they survive reloads and machine changes.
+*/
+
+/*
+    Configuration and constants
 */
 const LOG_PREFIX = "[YTSM/BG]";
 const CLIENT_ID = config.CLIENT_ID;
+const SEARCH_API_KEY = config.SEARCH_API_KEY;
 const REDIRECT_URI = `https://${chrome.runtime.id}.chromiumapp.org/`;
 const SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"];
 const TOKEN_KEY = "oauth_token";
-const SEARCH_API_KEY = config.SEARCH_API_KEY;
 
 /*
-    Caches and TTLs
+    Cache TTLs and operational thresholds
+
+    ONE_HOUR_MS controls the legacy per-channel cache freshness.
+    SUB_LIST_TTL_MS controls how often the full subscription index is refreshed.
+    NEGATIVE_CACHE_TTL_MS prevents hammering unresolved handles.
+    HANDLE_RESOLVE_TIMEOUT_MS bounds HTML fetch latency for handle pages.
 */
 const ONE_HOUR_MS = 60 * 60 * 1000;
+const SUB_LIST_TTL_MS = 12 * 60 * 60 * 1000;
 const NEGATIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const HANDLE_RESOLVE_TIMEOUT_MS = 8000;
 
 /*
-    Subscription list sync
+    Pagination size for subscriptions.list
+
+    50 is the API maximum and reduces round trips during initial sync.
 */
-const SUB_LIST_TTL_MS = 12 * 60 * 60 * 1000;
 const SUB_LIST_BATCH = 50;
+
+/*
+    Storage keys
+*/
 const SUBS_INDEX_KEY = "subscriptionsIndex";
 
 /*
-    Warm-start per-channel budget
+    Warm-start per-channel API budget
+
+    Used only while the subscription index is missing or stale.
+    This allows visible tiles to light up immediately without burning excessive quota.
 */
 const PC_BUDGET_MAX = 20;
 const PC_BUDGET_REFILL_MS = 60_000;
@@ -35,44 +70,47 @@ let pcTokens = PC_BUDGET_MAX;
 let pcLastRefill = Date.now();
 
 /*
-    Negative verification safety net
-    Used when subs index says "not subscribed", to spot-check a few per minute
+    Negative verification budget
+
+    Occasionally re-verify channels that the local index considers "not subscribed".
+    This catches rare drift and ensures high accuracy without frequent API calls.
 */
 const VERIFY_BUDGET_MAX = 10;
 const VERIFY_BUDGET_REFILL_MS = 60_000;
+const VERIFY_NEG_TTL_MS = 6 * 60 * 60 * 1000;
 let verifyTokens = VERIFY_BUDGET_MAX;
 let verifyLastRefill = Date.now();
-const VERIFY_NEG_TTL_MS = 6 * 60 * 60 * 1000;
 
 /*
-    In-memory mirrors
+    In-memory mirrors for persisted caches
+
+    cache                legacy per-channel results
+    handleToChannelCache map of @handle -> UC..., or a negative marker object
+    subsIndex            bulk list of user subscriptions
+    lastNegativeVerifyAt throttle map for negative verifications
 */
 let cache = {};
 let handleToChannelCache = {};
 let subsIndex = { updatedAt: 0, ids: [] };
+let lastNegativeVerifyAt = {};
 let syncing = false;
 
 /*
-    Tracks last negative verification time per channel to avoid repeats
-*/
-let lastNegativeVerifyAt = {};
-
-/*
-    Bootstrap caches from storage
+    Load caches from storage at worker start
 */
 chrome.storage.local.get(
     ["subscriptionCache", "handleChannelCache", SUBS_INDEX_KEY],
     data => {
         if (data.subscriptionCache && typeof data.subscriptionCache === "object") {
             cache = data.subscriptionCache;
-            console.log(LOG_PREFIX, "loaded subscription cache:", Object.keys(cache).length);
+            console.log(LOG_PREFIX, "loaded subscription cache entries:", Object.keys(cache).length);
         } else {
             console.log(LOG_PREFIX, "no subscription cache found");
         }
 
         if (data.handleChannelCache && typeof data.handleChannelCache === "object") {
             handleToChannelCache = data.handleChannelCache;
-            console.log(LOG_PREFIX, "loaded handle cache:", Object.keys(handleToChannelCache).length);
+            console.log(LOG_PREFIX, "loaded handle cache entries:", Object.keys(handleToChannelCache).length);
         } else {
             console.log(LOG_PREFIX, "no handle cache found");
         }
@@ -81,18 +119,18 @@ chrome.storage.local.get(
             subsIndex = data[SUBS_INDEX_KEY];
             console.log(
                 LOG_PREFIX,
-                "loaded subs index size:",
+                "loaded subscriptions index size:",
                 subsIndex.ids.length,
                 "updatedAt:",
                 new Date(subsIndex.updatedAt).toISOString()
             );
         } else {
-            console.log(LOG_PREFIX, "no subs index found");
+            console.log(LOG_PREFIX, "no subscriptions index found");
         }
 
         getValidToken().then(tok => {
             if (tok && isSubsIndexStale()) {
-                console.log(LOG_PREFIX, "subs index stale, starting background sync");
+                console.log(LOG_PREFIX, "subscriptions index is stale, starting background sync");
                 void ensureSubsIndexFresh(false);
             }
         });
@@ -100,7 +138,9 @@ chrome.storage.local.get(
 );
 
 /*
-    Storage save
+    Persist all caches atomically to storage
+
+    This keeps background state consistent across restarts and content script reloads.
 */
 async function saveCachesToStorage() {
     return new Promise(resolve => {
@@ -119,7 +159,7 @@ async function saveCachesToStorage() {
 }
 
 /*
-    Helpers
+    Utility helpers
 */
 function isSubsIndexStale() {
     return !subsIndex.updatedAt || (Date.now() - subsIndex.updatedAt) > SUB_LIST_TTL_MS;
@@ -139,7 +179,7 @@ function refillPcTokens() {
     if (now - pcLastRefill >= PC_BUDGET_REFILL_MS) {
         pcTokens = PC_BUDGET_MAX;
         pcLastRefill = now;
-        console.log(LOG_PREFIX, "warm-start per-channel tokens refilled to", pcTokens);
+        console.log(LOG_PREFIX, "warm-start tokens refilled to", pcTokens);
     }
 }
 
@@ -158,7 +198,7 @@ function refillVerifyTokens() {
     if (now - verifyLastRefill >= VERIFY_BUDGET_REFILL_MS) {
         verifyTokens = VERIFY_BUDGET_MAX;
         verifyLastRefill = now;
-        console.log(LOG_PREFIX, "verify tokens refilled to", verifyTokens);
+        console.log(LOG_PREFIX, "negative verification tokens refilled to", verifyTokens);
     }
 }
 
@@ -166,12 +206,17 @@ function consumeVerifyToken() {
     refillVerifyTokens();
     if (verifyTokens > 0) {
         verifyTokens -= 1;
-        console.log(LOG_PREFIX, "verify token consumed, remaining:", verifyTokens);
+        console.log(LOG_PREFIX, "negative verification token consumed, remaining:", verifyTokens);
         return true;
     }
     return false;
 }
 
+/*
+    Deep key finder used when YouTube changes object shapes in embedded JSON
+
+    Searches a JSON object graph for a key name and validates the value format.
+*/
 function findKeyInObject(obj, keyToFind, validateFn) {
     if (typeof obj !== "object" || obj === null) return null;
     for (const key in obj) {
@@ -188,6 +233,12 @@ function findKeyInObject(obj, keyToFind, validateFn) {
     return null;
 }
 
+/*
+    Fetch with timeout helper
+
+    Aborts fetches that outlive expected latency to avoid dangling worker work
+    and to keep handle resolution snappy under network hiccups.
+*/
 async function fetchWithTimeout(url, opts = {}, timeoutMs = HANDLE_RESOLVE_TIMEOUT_MS) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -199,7 +250,7 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = HANDLE_RESOLVE_TIMEO
 }
 
 /*
-    OAuth
+    OAuth storage helpers
 */
 async function getTokenFromStorage() {
     return new Promise(resolve => {
@@ -215,6 +266,11 @@ async function clearToken() {
     return new Promise(resolve => chrome.storage.local.remove([TOKEN_KEY], () => resolve()));
 }
 
+/*
+    OAuth URL builder
+
+    Uses implicit flow with a chrome-extension redirect origin bound to the extension ID.
+*/
 function buildAuthUrl(promptType) {
     const params = new URLSearchParams({
         response_type: "token",
@@ -226,6 +282,11 @@ function buildAuthUrl(promptType) {
     return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
 }
 
+/*
+    Start OAuth flow and persist the token
+
+    The implicit flow returns an access_token in the URL fragment.
+*/
 async function fetchToken(interactive, promptType) {
     const authUrl = buildAuthUrl(promptType);
     return new Promise((resolve, reject) => {
@@ -246,6 +307,9 @@ async function fetchToken(interactive, promptType) {
     });
 }
 
+/*
+    Validate local token freshness
+*/
 async function getValidToken() {
     const token = await getTokenFromStorage();
     if (token && token.expiry_date > Date.now()) return token;
@@ -253,21 +317,24 @@ async function getValidToken() {
 }
 
 /*
-    Full subscriptions sync
+    Bulk sync of subscriptions
+
+    Retrieves the user's channels via subscriptions.list with mine=true.
+    Uses a narrow fields mask to reduce payload size. Stores result as a Set surrogate.
 */
 async function ensureSubsIndexFresh(force = false) {
     if (syncing) {
-        console.log(LOG_PREFIX, "subs sync already running");
+        console.log(LOG_PREFIX, "subscriptions sync already running");
         return false;
     }
     if (!force && !isSubsIndexStale()) {
-        console.log(LOG_PREFIX, "subs index fresh, skipping sync");
+        console.log(LOG_PREFIX, "subscriptions index fresh, skipping sync");
         return false;
     }
 
     const token = await getValidToken();
     if (!token) {
-        console.log(LOG_PREFIX, "no valid token, cannot sync subs");
+        console.log(LOG_PREFIX, "no valid token, cannot sync subscriptions");
         return false;
     }
 
@@ -310,7 +377,7 @@ async function ensureSubsIndexFresh(force = false) {
         }
 
         await setSubsIndex(allIds);
-        console.log(LOG_PREFIX, "subscriptions synced, total:", allIds.length);
+        console.log(LOG_PREFIX, "subscriptions synced, total channels:", allIds.length);
         return true;
     } catch (e) {
         console.warn(LOG_PREFIX, "subscriptions sync failed:", e?.message || e);
@@ -321,7 +388,10 @@ async function ensureSubsIndexFresh(force = false) {
 }
 
 /*
-    Handle resolution
+    HTML parsers for channelId discovery
+
+    These paths and patterns cover common YouTube layout variants. This avoids API usage
+    for handle resolution in the majority of cases and is resilient to minor markup changes.
 */
 function extractChannelIdFromHtml(html) {
     const direct = html.match(/"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"/);
@@ -360,6 +430,9 @@ function extractChannelIdFromHtml(html) {
     return null;
 }
 
+/*
+    Attempt handle resolution via HTML scraping across multiple canonical pages
+*/
 async function fetchChannelIdFromHandlePage(handle) {
     const clean = handle.startsWith("@") ? handle.slice(1) : handle;
     const paths = [
@@ -378,9 +451,16 @@ async function fetchChannelIdFromHandlePage(handle) {
         } catch {
         }
     }
+
     return null;
 }
 
+/*
+    Search API fallback for handle resolution
+
+    This is quota-expensive relative to HTML parsing. Apply a simple scoring heuristic
+    that prefers exact equality on customUrl and channelTitle.
+*/
 async function getChannelIdFromApi(handle) {
     const qRaw = handle.startsWith("@") ? handle.slice(1) : handle;
     const queries = [`@${qRaw}`, qRaw];
@@ -420,6 +500,9 @@ async function getChannelIdFromApi(handle) {
     return null;
 }
 
+/*
+    Resolve @handle to UC channelId with layered fallbacks and negative caching
+*/
 async function resolveHandleToChannelId(handle) {
     if (handleToChannelCache[handle] !== undefined && handleToChannelCache[handle] !== null) {
         const cached = handleToChannelCache[handle];
@@ -467,6 +550,8 @@ async function resolveHandleToChannelId(handle) {
 
 /*
     Per-channel subscription check
+
+    This is used in warm-start or negative verification scenarios.
 */
 async function checkSubscribedPerChannel(channelId) {
     const token = await getValidToken();
@@ -500,7 +585,14 @@ async function checkSubscribedPerChannel(channelId) {
 }
 
 /*
-    Main check with hybrid safety nets
+    Core membership check with hybrid safety nets
+
+    Order of preference:
+    1) Resolve handle if needed
+    2) If full index exists, use O(1) set lookup
+    3) If index stale and warm-start tokens available, do per-channel API check
+    4) Otherwise rely on recent legacy cache as a backstop
+    5) Negative verification: opportunistically confirm "no" answers under a small budget
 */
 async function isUserSubscribedLocal(idOrHandle) {
     let channelId = idOrHandle;
@@ -530,7 +622,7 @@ async function isUserSubscribedLocal(idOrHandle) {
             if (verified && !subsSet().has(channelId)) {
                 subsIndex.ids.push(channelId);
                 await saveCachesToStorage();
-                console.log(LOG_PREFIX, "negative verify found new subscription, updating subs index");
+                console.log(LOG_PREFIX, "negative verify found new subscription, subs index updated");
             }
             return verified;
         }
@@ -556,7 +648,10 @@ async function isUserSubscribedLocal(idOrHandle) {
 }
 
 /*
-    Messaging
+    Message bus
+
+    All calls from content scripts come through here. Responses are always
+    finite and idempotent so the UI never blocks on long-lived background work.
 */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "bulkCheckChannels") {
@@ -621,7 +716,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 /*
-    Click action: authenticate and force subs sync
+    Toolbar click handler
+
+    Initiates OAuth and forces a subscriptions sync so UI can light up immediately.
 */
 chrome.action.onClicked.addListener(async () => {
     try {

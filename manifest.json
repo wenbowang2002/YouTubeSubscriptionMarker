@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "YouTube Subscription Marker",
-    "version": "1.0",
+    "version": "1.0.0",
     "description": "Marks subscribed channels with an icon next to the channel name on YouTube surfaces.",
     "permissions": [
         "storage",
