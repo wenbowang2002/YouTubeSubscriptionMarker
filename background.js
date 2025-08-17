@@ -1,5 +1,6 @@
 // background.js
 
+// Import configuration for OAuth client id and API key.
 import config from "./config.js";
 
 /*
@@ -8,32 +9,57 @@ import config from "./config.js";
     Purpose
     Own OAuth, YouTube Data API access, channel reference resolution, and persistent caching. Provide low-quota,
     O(1) membership checks to the content script through a locally maintained subscriptions index.
-
-    Quota Strategy
-    Prefer a local subscriptions index for membership decisions. Resolve channel references to UC ids by HTML parsing with
-    short timeouts and host variants. Use the Search API only as a minimal fallback. Persist negative results to avoid
-    repeated work. Occasionally re-verify negative answers under a small budget.
-
-    Logging
-    Structured logger with levels and throttled heartbeats for stage checks without log spam.
-
-    Formatting
-    Four spaces indentation and block comments only.
 */
 
 /*
-    Section: Logger
+    Code Block: Debug Flag
+
+    Purpose
+    Allow runtime control over verbosity and interactive debug features from chrome.storage.local.
+
+    Inputs
+    - storage key "ytsm_debug" (boolean)
+
+    Outputs
+    - DEBUG boolean
+*/
+const DEBUG_DEFAULT = false;
+let DEBUG = DEBUG_DEFAULT;
+try {
+    chrome?.storage?.local?.get?.(["ytsm_debug"], s => {
+        if (typeof s?.ytsm_debug === "boolean") DEBUG = s.ytsm_debug;
+    });
+} catch {}
+
+/*
+    Function: makeLogger
+
+    Purpose
+    Provide a structured logger with level gating and throttled heartbeat messages.
+
+    Inputs
+    - prefix: string printed before each log line
+    - level: "error" | "warn" | "info" | "debug"
+    - heartbeatMs: minimum interval between heartbeat logs per tag in milliseconds
+
+    Outputs
+    - An object with { error, warn, info, debug, heartbeat } methods
 */
 function makeLogger(prefix, level = "info", heartbeatMs = 2500) {
+    // Define rank thresholds and track last heartbeat per tag.
     const rank = { error: 0, warn: 1, info: 2, debug: 3 };
     const min = rank[level] ?? 2;
     const last = new Map();
+
+    // Emit a log message if level passes threshold.
     function emit(tag, args) {
         const r = rank[tag] ?? 3;
         if (r > min) return;
         const fn = console[tag] || console.log;
         fn(prefix, ...args);
     }
+
+    // Emit throttled heartbeat messages to avoid log spam.
     function heartbeat(tag, argsFactory) {
         const now = Date.now();
         const prev = last.get(tag) || 0;
@@ -42,6 +68,8 @@ function makeLogger(prefix, level = "info", heartbeatMs = 2500) {
             try { emit("info", argsFactory()); } catch {}
         }
     }
+
+    // Return the structured logger API.
     return {
         error: (...a) => emit("error", a),
         warn: (...a) => emit("warn", a),
@@ -51,25 +79,28 @@ function makeLogger(prefix, level = "info", heartbeatMs = 2500) {
     };
 }
 
-const logger = makeLogger("[YTSM/BG]", "info", 3000);
+// Create a logger instance for the background worker.
+// In DEBUG: more verbose, faster heartbeat. Otherwise: warn-level, slower heartbeat.
+const logger = makeLogger("[YTSM/BG]", DEBUG ? "info" : "warn", DEBUG ? 3000 : 30000);
 
-/*
-    Section: Configuration and State
-*/
+// OAuth, API, and storage keys.
 const CLIENT_ID = config.CLIENT_ID;
 const SEARCH_API_KEY = config.SEARCH_API_KEY;
 const REDIRECT_URI = `https://${chrome.runtime.id}.chromiumapp.org/`;
 const SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"];
 const TOKEN_KEY = "oauth_token";
 
+// Time constants and TTLs.
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const SUB_LIST_TTL_MS = 12 * 60 * 60 * 1000;
 const NEGATIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const HANDLE_RESOLVE_TIMEOUT_MS = 8000;
 
+// Subscriptions paging constants.
 const SUB_LIST_BATCH = 50;
 const SUBS_INDEX_KEY = "subscriptionsIndex";
 
+// Token bucket budgets.
 const PC_BUDGET_MAX = 20;
 const PC_BUDGET_REFILL_MS = 60_000;
 let pcTokens = PC_BUDGET_MAX;
@@ -81,6 +112,7 @@ const VERIFY_NEG_TTL_MS = 6 * 60 * 60 * 1000;
 let verifyTokens = VERIFY_BUDGET_MAX;
 let verifyLastRefill = Date.now();
 
+// In-memory caches and state flags.
 let cache = {};
 let handleToChannelCache = {};
 let subsIndex = { updatedAt: 0, ids: [] };
@@ -88,32 +120,45 @@ let lastNegativeVerifyAt = {};
 let syncing = false;
 
 /*
-    Section: Startup Cache Hydration
+    Code Block: Startup Cache Hydration
 
     Purpose
-    Load caches from storage and kick a background subscriptions refresh if stale.
+    Load caches from storage and, if authenticated and stale, start a background subscriptions refresh.
+
+    Inputs
+    - None (reads from chrome.storage.local)
+
+    Outputs
+    - Initializes in-memory caches and may trigger ensureSubsIndexFresh(false)
 */
 chrome.storage.local.get(
     ["subscriptionCache", "handleChannelCache", SUBS_INDEX_KEY],
     data => {
+        // Load legacy per-channel cache entries if present.
         if (data.subscriptionCache && typeof data.subscriptionCache === "object") {
             cache = data.subscriptionCache;
             logger.info("per-channel cache entries", Object.keys(cache).length);
         } else {
             logger.info("no legacy per-channel cache");
         }
+
+        // Load handle/url resolution cache if present.
         if (data.handleChannelCache && typeof data.handleChannelCache === "object") {
             handleToChannelCache = data.handleChannelCache;
             logger.info("handle/url cache entries", Object.keys(handleToChannelCache).length);
         } else {
             logger.info("no handle/url cache");
         }
+
+        // Load subscriptions index if present.
         if (data[SUBS_INDEX_KEY] && Array.isArray(data[SUBS_INDEX_KEY].ids)) {
             subsIndex = data[SUBS_INDEX_KEY];
             logger.info("subscriptions index", subsIndex.ids.length, new Date(subsIndex.updatedAt).toISOString());
         } else {
             logger.info("no subscriptions index");
         }
+
+        // If token is valid and index is stale, trigger refresh.
         getValidToken().then(tok => {
             if (tok && isSubsIndexStale()) {
                 logger.info("subscriptions index stale; starting refresh");
@@ -127,15 +172,16 @@ chrome.storage.local.get(
     Function: saveCachesToStorage
 
     Purpose
-    Persist all caches atomically to chrome.storage.local.
+    Persist caches atomically for consistency.
 
-    Parameters
-    none
+    Inputs
+    - None (uses module-level caches)
 
-    Returns
-    Promise<void>
+    Outputs
+    - Promise<void>
 */
 async function saveCachesToStorage() {
+    // Persist all caches under distinct keys.
     return new Promise(resolve => {
         chrome.storage.local.set(
             {
@@ -152,15 +198,16 @@ async function saveCachesToStorage() {
     Function: isSubsIndexStale
 
     Purpose
-    Determine whether the subscriptions index has exceeded its TTL.
+    Determine if the subscriptions index TTL has expired.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    boolean
+    Outputs
+    - boolean
 */
 function isSubsIndexStale() {
+    // Compare current time against last updated timestamp.
     return !subsIndex.updatedAt || Date.now() - subsIndex.updatedAt > SUB_LIST_TTL_MS;
 }
 
@@ -168,15 +215,16 @@ function isSubsIndexStale() {
     Function: setSubsIndex
 
     Purpose
-    Replace the subscriptions index with a de-duplicated array and persist it.
+    Replace the subscriptions index with a de-duplicated list and timestamp.
 
-    Parameters
-    ids: string[]
+    Inputs
+    - ids: string[] of UC channel IDs
 
-    Returns
-    Promise<void>
+    Outputs
+    - Promise<void>
 */
 function setSubsIndex(ids) {
+    // Stamp updated time and remove duplicates.
     subsIndex = { updatedAt: Date.now(), ids: Array.from(new Set(ids)) };
     return saveCachesToStorage();
 }
@@ -185,15 +233,16 @@ function setSubsIndex(ids) {
     Function: subsSet
 
     Purpose
-    Provide a Set view of the current subscriptions index for O(1) lookups.
+    Expose a Set view of the current subscription IDs.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    Set<string>
+    Outputs
+    - Set<string>
 */
 function subsSet() {
+    // Convert index array to a Set for O(1) lookups.
     return new Set(subsIndex.ids);
 }
 
@@ -201,15 +250,16 @@ function subsSet() {
     Function: refillPcTokens
 
     Purpose
-    Refill the per-channel warm-start token bucket when its interval elapses.
+    Refill the per-channel token bucket on interval.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    void
+    Outputs
+    - void
 */
 function refillPcTokens() {
+    // If interval elapsed, refill and move the window.
     const now = Date.now();
     if (now - pcLastRefill >= PC_BUDGET_REFILL_MS) {
         pcTokens = PC_BUDGET_MAX;
@@ -221,15 +271,16 @@ function refillPcTokens() {
     Function: consumePcToken
 
     Purpose
-    Consume a warm-start token if available.
+    Attempt to consume a per-channel token.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    boolean
+    Outputs
+    - boolean
 */
 function consumePcToken() {
+    // Ensure tokens are current, then spend if available.
     refillPcTokens();
     if (pcTokens > 0) {
         pcTokens -= 1;
@@ -242,15 +293,16 @@ function consumePcToken() {
     Function: refillVerifyTokens
 
     Purpose
-    Refill the negative-verification token bucket when its interval elapses.
+    Refill the negative-verification token bucket on interval.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    void
+    Outputs
+    - void
 */
 function refillVerifyTokens() {
+    // If interval elapsed, refill and move the window.
     const now = Date.now();
     if (now - verifyLastRefill >= VERIFY_BUDGET_REFILL_MS) {
         verifyTokens = VERIFY_BUDGET_MAX;
@@ -262,15 +314,16 @@ function refillVerifyTokens() {
     Function: consumeVerifyToken
 
     Purpose
-    Consume a negative-verification token if available.
+    Attempt to consume a verification token.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    boolean
+    Outputs
+    - boolean
 */
 function consumeVerifyToken() {
+    // Ensure tokens are current, then spend if available.
     refillVerifyTokens();
     if (verifyTokens > 0) {
         verifyTokens -= 1;
@@ -283,19 +336,22 @@ function consumeVerifyToken() {
     Function: fetchWithTimeout
 
     Purpose
-    Perform a fetch with an AbortController timeout.
+    Perform a fetch with an abort controller timeout.
 
-    Parameters
-    url: string
-    opts: RequestInit
-    timeoutMs: number
+    Inputs
+    - url: string
+    - opts: RequestInit
+    - timeoutMs: number
 
-    Returns
-    Promise<Response>
+    Outputs
+    - Promise<Response>
 */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = HANDLE_RESOLVE_TIMEOUT_MS) {
+    // Create controller and program a timeout abort.
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
+
+    // Run fetch with signal and follow redirects; always clear timer.
     try {
         return await fetch(url, { ...opts, signal: controller.signal, redirect: "follow" });
     } finally {
@@ -307,15 +363,16 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = HANDLE_RESOLVE_TIMEO
     Function: getTokenFromStorage
 
     Purpose
-    Read the persisted OAuth token from chrome.storage.local.
+    Read OAuth token from chrome.storage.local.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    Promise<object|null>
+    Outputs
+    - Promise<object|null>
 */
 async function getTokenFromStorage() {
+    // Fetch the token record; default to null.
     return new Promise(resolve => {
         chrome.storage.local.get([TOKEN_KEY], data => resolve(data[TOKEN_KEY] || null));
     });
@@ -325,15 +382,16 @@ async function getTokenFromStorage() {
     Function: setTokenInStorage
 
     Purpose
-    Persist the OAuth token to chrome.storage.local.
+    Persist OAuth token object.
 
-    Parameters
-    token: object
+    Inputs
+    - token: object with { access_token, expiry_date }
 
-    Returns
-    Promise<void>
+    Outputs
+    - Promise<void>
 */
 async function setTokenInStorage(token) {
+    // Write token to storage under a single key.
     return new Promise(resolve => chrome.storage.local.set({ [TOKEN_KEY]: token }, () => resolve()));
 }
 
@@ -341,15 +399,16 @@ async function setTokenInStorage(token) {
     Function: clearToken
 
     Purpose
-    Remove the OAuth token from storage.
+    Remove the persisted OAuth token.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    Promise<void>
+    Outputs
+    - Promise<void>
 */
 async function clearToken() {
+    // Delete token key for a clean re-auth.
     return new Promise(resolve => chrome.storage.local.remove([TOKEN_KEY], () => resolve()));
 }
 
@@ -357,15 +416,16 @@ async function clearToken() {
     Function: buildAuthUrl
 
     Purpose
-    Construct the Google OAuth implicit flow URL for this extension.
+    Construct the Google OAuth implicit flow URL.
 
-    Parameters
-    promptType: string | undefined
+    Inputs
+    - promptType: optional prompt parameter (e.g., "consent")
 
-    Returns
-    string
+    Outputs
+    - string URL
 */
 function buildAuthUrl(promptType) {
+    // Encode OAuth params and append optional prompt.
     const params = new URLSearchParams({
         response_type: "token",
         client_id: CLIENT_ID,
@@ -380,17 +440,20 @@ function buildAuthUrl(promptType) {
     Function: fetchToken
 
     Purpose
-    Launch the OAuth flow and persist the returned token.
+    Launch OAuth flow, parse returned token, and persist it.
 
-    Parameters
-    interactive: boolean
-    promptType: string | undefined
+    Inputs
+    - interactive: boolean to allow UI
+    - promptType: string for prompt behavior
 
-    Returns
-    Promise<object>
+    Outputs
+    - Promise<object> token object
 */
 async function fetchToken(interactive, promptType) {
+    // Build the auth URL once.
     const authUrl = buildAuthUrl(promptType);
+
+    // Launch the flow and parse token from the redirect fragment.
     return new Promise((resolve, reject) => {
         chrome.identity.launchWebAuthFlow({ url: authUrl, interactive }, async redirectUrl => {
             if (chrome.runtime.lastError || !redirectUrl) {
@@ -402,6 +465,8 @@ async function fetchToken(interactive, promptType) {
             const access_token = params.get("access_token");
             const expires_in = parseInt(params.get("expires_in"), 10);
             if (!access_token) return reject(new Error("no access token found"));
+
+            // Persist token with absolute expiry.
             const tokenObj = { access_token, expiry_date: Date.now() + expires_in * 1000 };
             await setTokenInStorage(tokenObj);
             resolve(tokenObj);
@@ -413,15 +478,16 @@ async function fetchToken(interactive, promptType) {
     Function: getValidToken
 
     Purpose
-    Return a cached token if not expired.
+    Return a non-expired token or null.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    Promise<object|null>
+    Outputs
+    - Promise<object|null>
 */
 async function getValidToken() {
+    // Read token and check expiry.
     const token = await getTokenFromStorage();
     if (token && token.expiry_date > Date.now()) return token;
     return null;
@@ -431,18 +497,16 @@ async function getValidToken() {
     Function: ensureSubsIndexFresh
 
     Purpose
-    Retrieve the user's subscriptions and persist them as a de-duplicated list of UC ids.
+    Refresh the user's subscriptions index via YouTube Data API paging under TTL or force.
 
-    Parameters
-    force: boolean
+    Inputs
+    - force: boolean to ignore TTL
 
-    Returns
-    Promise<boolean>
-
-    Quota
-    Uses YouTube Data API only on TTL expiry or explicit refresh.
+    Outputs
+    - Promise<boolean> true on successful refresh
 */
 async function ensureSubsIndexFresh(force = false) {
+    // Prevent concurrent runs and skip if fresh unless forced.
     if (syncing) {
         logger.info("subscriptions refresh already running");
         return false;
@@ -451,11 +515,15 @@ async function ensureSubsIndexFresh(force = false) {
         logger.debug("subscriptions index fresh");
         return false;
     }
+
+    // Require a valid token to proceed.
     const token = await getValidToken();
     if (!token) {
         logger.warn("no valid token; sign in to load subscriptions");
         return false;
     }
+
+    // Iterate over paginated results to collect all UC IDs.
     syncing = true;
     logger.info("subscriptions refresh started");
     try {
@@ -464,7 +532,9 @@ async function ensureSubsIndexFresh(force = false) {
         let pages = 0;
         const fields = "nextPageToken,items(snippet/resourceId/channelId)";
         const base = `https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=${SUB_LIST_BATCH}&fields=${encodeURIComponent(fields)}`;
+
         while (true) {
+            // Request next page and handle authorization problems.
             const url = pageToken ? `${base}&pageToken=${pageToken}` : base;
             const resp = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${token.access_token}` } }, 15000);
             if (!resp.ok) {
@@ -474,6 +544,8 @@ async function ensureSubsIndexFresh(force = false) {
                 }
                 throw new Error(`subscriptions api ${resp.status} ${resp.statusText}`);
             }
+
+            // Append channel IDs from this page.
             const data = await resp.json();
             pages += 1;
             if (Array.isArray(data.items)) {
@@ -482,6 +554,8 @@ async function ensureSubsIndexFresh(force = false) {
                     if (id && id.startsWith("UC")) allIds.push(id);
                 }
             }
+
+            // Emit progress and continue if more pages exist.
             logger.heartbeat("subs-progress", () => ["pages", pages, "accum", allIds.length]);
             if (data.nextPageToken) {
                 pageToken = data.nextPageToken;
@@ -489,13 +563,17 @@ async function ensureSubsIndexFresh(force = false) {
                 break;
             }
         }
+
+        // Deduplicate and persist the final index.
         await setSubsIndex(allIds);
         logger.info("subscriptions synced", allIds.length);
         return true;
     } catch (e) {
+        // Surface failure without throwing through the bus.
         logger.error("subscriptions refresh failed", e?.message || e);
         return false;
     } finally {
+        // Always clear the syncing flag.
         syncing = false;
     }
 }
@@ -504,18 +582,21 @@ async function ensureSubsIndexFresh(force = false) {
     Function: findKeyInObject
 
     Purpose
-    Recursively search an object graph for a string value under a given key name, validated by a predicate.
+    Recursively search an object graph for a key with a string value passing an optional validator.
 
-    Parameters
-    obj: object
-    keyToFind: string
-    validateFn: function
+    Inputs
+    - obj: object to search
+    - keyToFind: string key name
+    - validateFn: function(string) => boolean (optional)
 
-    Returns
-    string | null
+    Outputs
+    - string|null value found
 */
 function findKeyInObject(obj, keyToFind, validateFn) {
+    // If not an object, stop search.
     if (typeof obj !== "object" || obj === null) return null;
+
+    // Iterate own properties, check match or recurse into child objects.
     for (const key in obj) {
         if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
         const value = obj[key];
@@ -534,30 +615,24 @@ function findKeyInObject(obj, keyToFind, validateFn) {
     Function: extractChannelIdFromHtml
 
     Purpose
-    Extract the canonical UC id from a YouTube channel page with a strict priority order that avoids
-    accidental matches from nested JSON objects.
+    Extract the canonical UC channel id from raw YouTube channel HTML using layered heuristics.
 
-    Priority
-    1) metadata.channelMetadataRenderer.channelId
-    2) microformat.microformatDataRenderer.urlCanonical containing /channel/UC...
-    3) <link rel="canonical" href=".../channel/UC..."> or <meta property="og:url" ...>
-    4) explicit path occurrences of /channel/UC...
-    5) ytcfg.set(...) objects containing a channelId
-    6) deep graph search for "channelId" keys as a last resort
+    Inputs
+    - html: string of HTML content
 
-    Parameters
-    html: string
-
-    Returns
-    string | null
+    Outputs
+    - string|null UC id
 */
 function extractChannelIdFromHtml(html) {
+    // Preferred: ytInitialData metadata.channelMetadataRenderer.channelId.
     try {
         const initialMatch = html.match(/ytInitialData\s*=\s*({.*?});/s);
         if (initialMatch) {
             const j = JSON.parse(initialMatch[1]);
             const meta = j && j.metadata && j.metadata.channelMetadataRenderer && j.metadata.channelMetadataRenderer.channelId;
             if (typeof meta === "string" && /^UC[0-9A-Za-z_-]{22}$/.test(meta)) return meta;
+
+            // Fallback: microformat canonical channel URL.
             const canon = j && j.microformat && j.microformat.microformatDataRenderer && j.microformat.microformatDataRenderer.urlCanonical;
             if (typeof canon === "string") {
                 const m = canon.match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
@@ -565,6 +640,8 @@ function extractChannelIdFromHtml(html) {
             }
         }
     } catch {}
+
+    // Secondary: <link rel="canonical"> and <meta property="og:url"> checks.
     try {
         const linkCanon = html.match(/<link\s+rel=["']canonical["']\s+href=["']([^"']+)["']/i);
         if (linkCanon && linkCanon[1]) {
@@ -577,8 +654,12 @@ function extractChannelIdFromHtml(html) {
             if (m) return m[1];
         }
     } catch {}
+
+    // Simple path scan for "/channel/UC..." pattern.
     const path = html.match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
     if (path) return path[1];
+
+    // ytcfg.set(...) object search for a strict channelId value.
     try {
         const cfgMatch = html.match(/ytcfg\.set\(\s*({.*?})\s*\);/s);
         if (cfgMatch) {
@@ -587,6 +668,8 @@ function extractChannelIdFromHtml(html) {
             if (strict) return strict;
         }
     } catch {}
+
+    // As a last resort, search for "channelId" keys anywhere.
     try {
         const anyMatch = html.match(/"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"/);
         if (anyMatch) return anyMatch[1];
@@ -599,6 +682,8 @@ function extractChannelIdFromHtml(html) {
             if (deep) return deep;
         }
     } catch {}
+
+    // No match found.
     return null;
 }
 
@@ -606,20 +691,23 @@ function extractChannelIdFromHtml(html) {
     Function: normalizeRef
 
     Purpose
-    Normalize any channel reference and produce robust candidate URLs, including consent and mobile hosts.
+    Normalize a channel reference (UC id, @handle, /c, /user, absolute/relative URL) and produce URL candidates.
 
-    Parameters
-    ref: string
+    Inputs
+    - ref: string channel reference
 
-    Returns
-    { kind, value, urlCandidates[] }
+    Outputs
+    - { kind: string, value: string, urlCandidates: string[] }
 */
 function normalizeRef(ref) {
+    // Clean and fast-path empty and UC id inputs.
     let r = (ref || "").trim();
     if (!r) return { kind: "unknown", value: "", urlCandidates: [] };
     if (r.startsWith("UC") && r.length === 24) {
         return { kind: "uc", value: r, urlCandidates: [] };
     }
+
+    // Handle @handle by building base, mobile, and consent variants.
     if (r.startsWith("@")) {
         const clean = r.slice(1);
         const base = `https://www.youtube.com/@${clean}`;
@@ -631,6 +719,8 @@ function normalizeRef(ref) {
             urlCandidates: [base, `${base}/about`, `${base}/featured`, mob, `${mob}/about`, con]
         };
     }
+
+    // Normalize paths to absolute URLs and unify host; classify known patterns.
     try {
         if (!/^https?:\/\//i.test(r)) {
             r = `https://www.youtube.com${r.startsWith("/") ? "" : "/"}${r}`;
@@ -638,6 +728,8 @@ function normalizeRef(ref) {
         const u = new URL(r);
         const host = u.hostname.replace(/^m\./, "www.");
         const path = u.pathname;
+
+        // Detect /channel/UC..., /@..., /c/..., /user/... and assemble candidates.
         if (/^\/channel\/(UC[0-9A-Za-z_-]{22})/.test(path)) {
             const m = path.match(/^\/channel\/(UC[0-9A-Za-z_-]{22})/);
             if (m) return { kind: "uc", value: m[1], urlCandidates: [] };
@@ -664,8 +756,11 @@ function normalizeRef(ref) {
             const con = `https://consent.youtube.com/m?continue=${encodeURIComponent(base)}`;
             return { kind: "user", value: name, urlCandidates: [base, `${base}/about`, `${base}/featured`, mob, `${mob}/about`, con] };
         }
+
+        // Otherwise treat as a raw URL candidate.
         return { kind: "url", value: r, urlCandidates: [r] };
     } catch {
+        // Malformed input; mark unknown.
         return { kind: "unknown", value: r, urlCandidates: [] };
     }
 }
@@ -674,22 +769,26 @@ function normalizeRef(ref) {
     Function: resolveUcFromHtmlCandidates
 
     Purpose
-    Probe multiple candidates and also follow simple consent redirects where the UC id is embedded.
+    Fetch multiple URL candidates and extract a UC id by parsing HTML; follows simple consent redirects.
 
-    Parameters
-    urlCandidates: string[]
+    Inputs
+    - urlCandidates: string[] list of URLs to try
 
-    Returns
-    string|null
+    Outputs
+    - Promise<string|null> UC id or null
 */
 async function resolveUcFromHtmlCandidates(urlCandidates) {
+    // Iterate through candidates in order.
     for (const url of urlCandidates) {
         try {
+            // Fetch HTML and parse for a UC id.
             const resp = await fetchWithTimeout(url, {}, HANDLE_RESOLVE_TIMEOUT_MS);
             if (!resp.ok) continue;
             const html = await resp.text();
             const id = extractChannelIdFromHtml(html);
             if (id) return id;
+
+            // Detect consent "continue" link and follow once.
             const cont = html.match(/href="(https?:\/\/www\.youtube\.com\/[^"]+)"/);
             if (cont && cont[1]) {
                 const r2 = await fetchWithTimeout(cont[1], {}, HANDLE_RESOLVE_TIMEOUT_MS);
@@ -701,6 +800,7 @@ async function resolveUcFromHtmlCandidates(urlCandidates) {
             }
         } catch {}
     }
+    // Return null if none yielded a UC id.
     return null;
 }
 
@@ -708,23 +808,23 @@ async function resolveUcFromHtmlCandidates(urlCandidates) {
     Function: searchChannelIdFallback
 
     Purpose
-    Query YouTube Search API to get a channel id when HTML parsing fails.
+    Use the YouTube Search API to infer a UC id when HTML parsing fails.
 
-    Parameters
-    tokens: object returned by normalizeRef
-    apiKey: string
+    Inputs
+    - tokens: normalized reference object from normalizeRef
+    - apiKey: YouTube Data API key
 
-    Returns
-    string UC id or null
-
-    Quota
-    Uses search.list with type=channel and maxResults=5 under strict budget.
+    Outputs
+    - Promise<string|null> UC id or null
 */
 async function searchChannelIdFallback(tokens, apiKey) {
+    // Prepare search terms from handle or custom identifiers.
     const candidates = [];
     if (tokens.kind === "handle") candidates.push(tokens.value);
     if (tokens.kind === "c") candidates.push(tokens.value, "@" + tokens.value);
     if (tokens.kind === "user") candidates.push(tokens.value, "@" + tokens.value);
+
+    // Query for each candidate and score best matches.
     for (const q of candidates) {
         const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=5&q=${encodeURIComponent(q)}&key=${apiKey}`;
         try {
@@ -732,6 +832,8 @@ async function searchChannelIdFallback(tokens, apiKey) {
             if (!resp.ok) continue;
             const data = await resp.json();
             if (!data.items || !Array.isArray(data.items)) continue;
+
+            // Score by exact/contains matches of customUrl and title.
             let best = null;
             let bestScore = -1;
             const qn = q.toLowerCase();
@@ -753,6 +855,7 @@ async function searchChannelIdFallback(tokens, apiKey) {
             if (best) return best;
         } catch {}
     }
+    // No suitable match found.
     return null;
 }
 
@@ -760,21 +863,21 @@ async function searchChannelIdFallback(tokens, apiKey) {
     Function: resolveRefToUc
 
     Purpose
-    Resolve any channel reference to a UC id using layered fallbacks and negative caching.
+    Resolve any channel reference into a UC id using cache, HTML probing, and search fallback.
 
-    Parameters
-    ref: string
+    Inputs
+    - ref: string reference (UC/@/c/user/URL)
 
-    Returns
-    Promise<string|null>
-
-    Side Effects
-    Updates handleToChannelCache and persists caches.
+    Outputs
+    - Promise<string|null> UC id or null
 */
 async function resolveRefToUc(ref) {
+    // Normalize reference and check immediate UC fast path.
     const norm = normalizeRef(ref);
     const key = `${norm.kind}:${norm.value}`.toLowerCase();
     if (norm.kind === "uc") return norm.value;
+
+    // Consult cache; honor negative cache TTL.
     if (handleToChannelCache[key] !== undefined && handleToChannelCache[key] !== null) {
         const cached = handleToChannelCache[key];
         if (typeof cached === "object" && cached._neg) {
@@ -784,24 +887,31 @@ async function resolveRefToUc(ref) {
                 return null;
             }
         } else {
-            logger.debug("cached", key, "=>", cached);
+            // In DEBUG we surface more; otherwise keep it quiet at debug level.
+            if (DEBUG) logger.info("cached", key, "=>", cached); else logger.debug("cached", key, "=>", cached);
             return cached;
         }
     }
-    logger.info("resolving", key);
+
+    // Try HTML resolution and then API search fallback.
+    if (DEBUG) logger.info("resolving", key); else logger.debug("resolving", key);
     let channelId = await resolveUcFromHtmlCandidates(norm.urlCandidates);
     if (!channelId && SEARCH_API_KEY) {
         channelId = await searchChannelIdFallback(norm, SEARCH_API_KEY);
     }
+
+    // Cache negative result to avoid repeated work.
     if (!channelId) {
         handleToChannelCache[key] = { _neg: true, ts: Date.now() };
         await saveCachesToStorage();
         logger.warn("resolve failed", key);
         return null;
     }
+
+    // Cache and persist positive mapping.
     handleToChannelCache[key] = channelId;
     await saveCachesToStorage();
-    logger.info("resolved", key, "=>", channelId);
+    if (DEBUG) logger.info("resolved", key, "=>", channelId); else logger.debug("resolved", key, "=>", channelId);
     return channelId;
 }
 
@@ -809,19 +919,24 @@ async function resolveRefToUc(ref) {
     Function: checkSubscribedPerChannel
 
     Purpose
-    Perform a direct per-channel membership check using the YouTube Data API.
+    Perform an exact membership check for a specific UC id via the Subscriptions API.
 
-    Parameters
-    channelId: string
+    Inputs
+    - channelId: string UC id
 
-    Returns
-    Promise<boolean>
+    Outputs
+    - Promise<boolean> subscribed
 */
 async function checkSubscribedPerChannel(channelId) {
+    // Require a valid token; otherwise false.
     const token = await getValidToken();
     if (!token) return false;
+
+    // Call subscriptions endpoint scoped to the channel id.
     const url = `https://www.googleapis.com/youtube/v3/subscriptions?part=subscriberSnippet&mine=true&forChannelId=${channelId}`;
     const resp = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${token.access_token}` } }, 10000);
+
+    // Handle token expiration and other non-OK statuses.
     if (!resp.ok) {
         if (resp.status === 401) {
             await clearToken();
@@ -831,8 +946,12 @@ async function checkSubscribedPerChannel(channelId) {
         logger.warn("per-channel api non-ok", resp.status, resp.statusText);
         return false;
     }
+
+    // Interpret presence of items as "subscribed".
     const data = await resp.json();
     const subscribed = !!(data.items && data.items.length > 0);
+
+    // Update short-lived cache and persist.
     cache[channelId] = { status: subscribed, updatedAt: Date.now() };
     await saveCachesToStorage();
     logger.debug("per-channel result", channelId, subscribed);
@@ -843,25 +962,30 @@ async function checkSubscribedPerChannel(channelId) {
     Function: isUserSubscribedLocal
 
     Purpose
-    Decide membership for a given reference using the subscriptions index, with safety nets.
+    Answer membership questions using the local subscriptions index first, with verification fallbacks.
 
-    Parameters
-    idOrRef: string
+    Inputs
+    - idOrRef: string UC id or reference
 
-    Returns
-    Promise<boolean>
+    Outputs
+    - Promise<boolean> subscribed
 */
 async function isUserSubscribedLocal(idOrRef) {
+    // Resolve any non-UC reference to UC id.
     let channelId = idOrRef;
     if (!channelId.startsWith("UC")) {
         const resolved = await resolveRefToUc(channelId);
         if (!resolved) return false;
         channelId = resolved;
     }
+
+    // Prefer the fast local index when present.
     if (subsIndex.ids && subsIndex.ids.length) {
         const inSet = subsSet().has(channelId);
         logger.debug("local subs check", channelId, inSet);
         if (inSet) return true;
+
+        // Occasionally re-verify negatives within a budget.
         const lastNeg = lastNegativeVerifyAt[channelId] || 0;
         const fresh = Date.now() - lastNeg < VERIFY_NEG_TTL_MS;
         if (!fresh && consumeVerifyToken()) {
@@ -877,6 +1001,8 @@ async function isUserSubscribedLocal(idOrRef) {
         }
         return false;
     }
+
+    // If index is absent and stale, use a budgeted per-channel call during warm start.
     if (isSubsIndexStale() && consumePcToken()) {
         try {
             return await checkSubscribedPerChannel(channelId);
@@ -884,6 +1010,8 @@ async function isUserSubscribedLocal(idOrRef) {
             return false;
         }
     }
+
+    // Fall back to recent legacy per-channel cache if fresh.
     const c = cache[channelId];
     if (c && Date.now() - c.updatedAt < ONE_HOUR_MS) {
         logger.debug("legacy cache check", channelId, c.status);
@@ -896,21 +1024,26 @@ async function isUserSubscribedLocal(idOrRef) {
     Function: getCurrentIdentity
 
     Purpose
-    Return the YouTube channel id and title associated with the current token.
+    Retrieve the authenticated user's YouTube channel id and title.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    Promise<{ channelId: string, title: string } | null>
+    Outputs
+    - Promise<{ channelId: string, title: string } | null>
 */
 async function getCurrentIdentity() {
+    // Require authentication.
     const token = await getValidToken();
     if (!token) return null;
+
+    // Request minimal identity fields for the current user.
     const fields = "items(id,snippet/title)";
     const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true&fields=${encodeURIComponent(fields)}`;
     const resp = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${token.access_token}` } }, 10000);
     if (!resp.ok) return null;
+
+    // Parse first channel record into a compact identity object.
     const data = await resp.json();
     const it = Array.isArray(data.items) && data.items[0] ? data.items[0] : null;
     if (!it || !it.id) return null;
@@ -919,12 +1052,21 @@ async function getCurrentIdentity() {
 }
 
 /*
-    Section: Message Bus
+    Code Block: Message Bus Listener
 
     Purpose
-    Handle all content-script requests in a finite, idempotent manner.
+    Handle all incoming messages from the content script in a finite, idempotent manner.
+
+    Inputs
+    - message: object with a "type" field and optional payload
+    - sender: chrome runtime sender
+    - sendResponse: callback to return a response
+
+    Outputs
+    - boolean to keep the channel open when necessary
 */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Batch membership checks for up to 200 ids/refs.
     if (message.type === "bulkCheckChannels") {
         const ids = Array.isArray(message.ids) ? message.ids.slice(0, 200) : [];
         const results = {};
@@ -940,6 +1082,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return true;
     }
+
+    // Single membership check.
     if (message.type === "checkChannel") {
         const { channelId } = message;
         isUserSubscribedLocal(channelId)
@@ -947,6 +1091,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             .catch(() => sendResponse({ subscribed: false }));
         return true;
     }
+
+    // Return cached short-lived per-channel status if available.
     if (message.type === "getCachedStatus") {
         const { channelId } = message;
         if (cache[channelId] !== undefined && cache[channelId] !== null) {
@@ -957,21 +1103,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         return true;
     }
+
+    // Report authentication state quickly.
     if (message.type === "checkAuth") {
         getValidToken().then(token => sendResponse({ authenticated: !!token }));
         return true;
     }
+
+    // Force subscriptions refresh and return summary.
     if (message.type === "refreshSubscriptions") {
         ensureSubsIndexFresh(true).then(updated => {
             sendResponse({ ok: updated, total: subsIndex.ids.length, updatedAt: subsIndex.updatedAt });
         });
         return true;
     }
+
+    // Invalidate cached handle/url mapping to force re-resolve next time.
     if (message.type === "invalidateHandle") {
         const raw = String(message.handle || "").trim();
         const norm = normalizeRef(raw.startsWith("@") || raw.startsWith("/") ? raw : "@" + raw);
         const k1 = `${norm.kind}:${norm.value}`.toLowerCase();
         let ok = false;
+
+        // Delete canonicalized key and raw-lowercased key if present.
         if (handleToChannelCache[k1] !== undefined) {
             delete handleToChannelCache[k1];
             ok = true;
@@ -980,14 +1134,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             delete handleToChannelCache[raw.toLowerCase()];
             ok = true;
         }
+
+        // Persist and respond.
         saveCachesToStorage().then(() => sendResponse({ ok }));
         return true;
     }
+
+    // Debug helper: resolve a ref and check membership.
     if (message.type === "debugResolve") {
         const ref = String(message.ref || "");
         (async () => {
             const norm = normalizeRef(ref);
             let resolvedUc = null;
+
+            // Resolve UC id via fast-path or fallbacks.
             if (norm.kind === "uc") {
                 resolvedUc = norm.value;
             } else {
@@ -996,6 +1156,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     resolvedUc = await searchChannelIdFallback(norm, SEARCH_API_KEY);
                 }
             }
+
+            // Determine membership using index or API.
             const set = subsSet();
             const inIndex = !!(resolvedUc && set.has(resolvedUc));
             const final = resolvedUc ? (inIndex ? true : await checkSubscribedPerChannel(resolvedUc)) : false;
@@ -1003,16 +1165,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         })();
         return true;
     }
+
+    // Report the current authenticated identity.
     if (message.type === "whoami") {
         getCurrentIdentity().then(identity => {
             sendResponse({ ok: !!identity, identity });
         });
         return true;
     }
+
+    // Explicit logout clears token.
     if (message.type === "logout") {
         clearToken().then(() => sendResponse({ ok: true }));
         return true;
     }
+
+    // Reauth and sync subscription index.
     if (message.type === "reauth") {
         (async () => {
             try {
@@ -1025,16 +1193,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         })();
         return true;
     }
+
+    // Unhandled type: do not consume.
     return false;
 });
 
 /*
-    Section: Toolbar
+    Code Block: Toolbar Click Handler
 
     Purpose
-    Authenticate with explicit account selection and force a subscriptions sync.
+    When the toolbar icon is clicked, prompt auth and perform a fresh subscriptions sync.
+
+    Inputs
+    - Click event from chrome.action
+
+    Outputs
+    - None (side effects: token and index updated)
 */
 chrome.action.onClicked.addListener(async () => {
+    // Wrap in try/catch for UX resilience.
     try {
         await fetchToken(true, "select_account consent");
         logger.info("authenticated; syncing subscriptions");

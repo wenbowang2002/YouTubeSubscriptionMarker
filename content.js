@@ -4,35 +4,59 @@
     Module: Content Script
 
     Purpose
-    Add a checkmark icon next to the channel-name text link on YouTube surfaces when subscribed.
-
-    Approach
-    Collect candidate anchors across light and shadow DOM, gate to channel-name links only, extract a robust channel
-    reference, batch query the background for membership, and add one icon per passing anchor.
-
-    Quota
-    No direct network calls. All checks are batched through the background worker.
-
-    Logging
-    Structured logger with level control and periodic heartbeats.
-
-    Formatting
-    Four spaces indentation and block comments only.
+    Append a small "subscribed" icon next to the channel-name text link on YouTube surfaces
+    when the logged-in user is subscribed.
 */
 
 /*
-    Section: Logger
+    Code Block: Debug Flag
+
+    Purpose
+    Runtime control over verbosity and interactive debug features from chrome.storage.local.
+
+    Inputs
+    - storage key "ytsm_debug" (boolean)
+
+    Outputs
+    - DEBUG boolean
+*/
+const DEBUG_DEFAULT = false;
+let DEBUG = DEBUG_DEFAULT;
+try {
+    chrome?.storage?.local?.get?.(["ytsm_debug"], s => {
+        if (typeof s?.ytsm_debug === "boolean") DEBUG = s.ytsm_debug;
+    });
+} catch {}
+
+/*
+    Function: makeLogger
+
+    Purpose
+    Provide a structured logger with level control and throttled heartbeats for the content script.
+
+    Inputs
+    - prefix: string prefix for log lines
+    - level: "error" | "warn" | "info" | "debug"
+    - heartbeatMs: throttle window for heartbeat logs
+
+    Outputs
+    - An object with { error, warn, info, debug, heartbeat }
 */
 function makeLogger(prefix, level = "info", heartbeatMs = 2500) {
+    // Define rank thresholds and track last heartbeat per tag.
     const rank = { error: 0, warn: 1, info: 2, debug: 3 };
     const min = rank[level] ?? 2;
     const last = new Map();
+
+    // Emit a log message if level passes threshold.
     function emit(tag, args) {
         const r = rank[tag] ?? 3;
         if (r > min) return;
         const fn = console[tag] || console.log;
         fn(prefix, ...args);
     }
+
+    // Emit throttled heartbeat messages to avoid log spam.
     function heartbeat(tag, argsFactory) {
         const now = Date.now();
         const prev = last.get(tag) || 0;
@@ -41,6 +65,8 @@ function makeLogger(prefix, level = "info", heartbeatMs = 2500) {
             try { emit("info", argsFactory()); } catch {}
         }
     }
+
+    // Return the structured logger API.
     return {
         error: (...a) => emit("error", a),
         warn: (...a) => emit("warn", a),
@@ -50,24 +76,26 @@ function makeLogger(prefix, level = "info", heartbeatMs = 2500) {
     };
 }
 
-const logger = makeLogger("[YTSM/CS]", "info", 3000);
+// Create a logger instance for the content script.
+// In DEBUG: more verbose, faster heartbeat. Otherwise: warn-level, slower heartbeat.
+const logger = makeLogger("[YTSM/CS]", DEBUG ? "info" : "warn", DEBUG ? 3000 : 30000);
 
-/*
-    Section: Timing and Queues
-*/
+// Bulk timing and queue sizing constants.
 const BULK_INTERVAL_MS = 800;
 const MAX_IDS_PER_BULK = 200;
 
+// Mutable observation and batching state.
 let observer = null;
 let pollTimer = null;
 let pendingRefs = new Set();
 let lastBulkAt = 0;
 
 /*
-    Section: Selectors
+    Code Block: Candidate Anchor Selectors
 
     Purpose
-    Broad patterns to scoop up channel-name anchors across YouTube surfaces. Gating is applied later.
+    Broad patterns to collect potential channel-name anchors across YouTube surfaces.
+    Gating functions will further narrow to only true channel-name links.
 */
 const SELECTOR_LIST = [
     'a[href^="/@"]',
@@ -92,33 +120,38 @@ const SELECTOR_LIST = [
 ];
 
 /*
-    Section: Exclusions
+    Code Block: Exclusion Rules
 
     Purpose
-    Containers and text to avoid to prevent false positives on subscribe UI and counts.
+    Exclude anchors that are part of subscribe UI, sentiment bars, shelf/tab titles, etc.,
+    to avoid false positives like "Videos", "Posts", etc.
 */
 const EXCLUDE_CONTAINERS = [
-    "#owner-sub-count",
     "ytd-subscribe-button-renderer",
     "ytd-sentiment-bar-renderer",
-    "ytd-video-owner-renderer #owner-sub-count"
+    "yt-tab-shape",
+    "tp-yt-paper-tab",
+    "tp-yt-paper-tabs",
+    "ytd-shelf-renderer #title"
 ];
 
+// Simple text guard for subscribe wording.
 const EXCLUDE_TEXT_REGEX = /\bsubscribe|subscribers?\b/i;
 
 /*
-    Section: Messaging
+    Function: safeSendMessage
 
     Purpose
-    Guarded bridge to background messaging to avoid context errors.
+    Send a message to the background script with guards for missing extension context.
 
-    Parameters
-    message: any
+    Inputs
+    - message: any
 
-    Returns
-    Promise<any|null>
+    Outputs
+    - Promise<any|null> response or null on failure
 */
 function safeSendMessage(message) {
+    // Wrap chrome.runtime.sendMessage and normalize errors to null.
     return new Promise(resolve => {
         try {
             if (typeof chrome === "undefined" || !chrome.runtime || !chrome.runtime.id) {
@@ -140,27 +173,33 @@ function safeSendMessage(message) {
 }
 
 /*
-    Section: Shadow DOM Traversal
+    Function: queryAllDeep
 
     Purpose
-    Collect matching anchors across light DOM and open shadow roots.
+    Collect matching elements across light DOM and open shadow roots.
 
-    Parameters
-    root: Node
-    selectors: string[]
+    Inputs
+    - root: Node to start the traversal
+    - selectors: string[] list of selectors
 
-    Returns
-    Element[]
+    Outputs
+    - Element[] matches
 */
 function queryAllDeep(root, selectors) {
+    // Combine selectors and track visited shadow roots to avoid cycles.
     const results = [];
     const selector = selectors.join(",");
     const visited = new WeakSet();
+
+    // Recursive scan that enters open shadow roots.
     function scan(node) {
+        // Collect matches at this level.
         try {
             const found = node.querySelectorAll(selector);
             for (const el of found) results.push(el);
         } catch {}
+
+        // Walk the element tree and dive into shadow roots once.
         const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT, null);
         let cur = walker.currentNode;
         while (cur) {
@@ -172,28 +211,33 @@ function queryAllDeep(root, selectors) {
             cur = walker.nextNode();
         }
     }
+
+    // Begin traversal and return all results.
     scan(root);
     return results;
 }
 
 /*
-    Section: Closest Across Shadows
+    Function: closestDeep
 
     Purpose
-    Element.closest replacement that climbs out of shadow roots through hosts.
+    Like Element.closest, but climbs through shadow roots via their hosts.
 
-    Parameters
-    startEl: Element
-    selector: string
+    Inputs
+    - startEl: Element to begin search
+    - selector: string CSS selector to match
 
-    Returns
-    Element | null
+    Outputs
+    - Element|null closest match
 */
 function closestDeep(startEl, selector) {
-    if (!startEl) return null;
+    // Safe matches helper to guard non-element nodes.
     function matches(el, sel) {
         try { return el instanceof Element && el.matches(sel); } catch { return false; }
     }
+
+    // Climb parent chain and hop from shadow root to host.
+    if (!startEl) return null;
     let el = startEl;
     while (el) {
         if (matches(el, selector)) return el;
@@ -209,60 +253,147 @@ function closestDeep(startEl, selector) {
 }
 
 /*
-    Section: Gates
+    Function: parseChannelRefFromHref
 
     Purpose
-    Validate anchors as channel-name links only.
+    Parse an anchor's href and classify whether it is a channel ROOT or SUBPAGE reference.
+    Only ROOT references are considered valid for adding the icon.
 
-    Parameters
-    a: HTMLAnchorElement
+    Inputs
+    - rawHref: string from the anchor's href attribute
 
-    Returns
-    boolean
+    Outputs
+    - { kind: "uc"|"handle"|"c"|"user", id: string, hasExtra: boolean } | null
 */
-function isChannelHref(a) {
-    const href = a.getAttribute("href") || "";
-    if (href.startsWith("/@") || href.startsWith("/channel/UC") || href.startsWith("/c/") || href.startsWith("/user/")) return true;
-    if (/^https:\/\/(www\.|m\.)?youtube\.com\//.test(href)) return true;
-    return false;
+function parseChannelRefFromHref(rawHref) {
+    // Normalize to absolute URL and extract pathname.
+    try {
+        const href = String(rawHref || "");
+        if (!href) return null;
+        const u = /^https?:\/\//i.test(href) ? new URL(href) : new URL(href, location.origin);
+        const path = u.pathname || "";
+        let m;
+
+        // Recognize /channel/UC... with optional trailing segment.
+        m = path.match(/^\/channel\/(UC[0-9A-Za-z_-]{22})(?:\/(.*))?$/);
+        if (m) return { kind: "uc", id: m[1], hasExtra: !!(m[2] && m[2].length) };
+
+        // Recognize /@handle with optional trailing segment.
+        m = path.match(/^\/@([^/]+)(?:\/(.*))?$/);
+        if (m) return { kind: "handle", id: "@" + m[1].toLowerCase(), hasExtra: !!(m[2] && m[2].length) };
+
+        // Recognize /c/name with optional trailing segment.
+        m = path.match(/^\/c\/([^/]+)(?:\/(.*))?$/);
+        if (m) return { kind: "c", id: "/c/" + m[1], hasExtra: !!(m[2] && m[2].length) };
+
+        // Recognize /user/name with optional trailing segment.
+        m = path.match(/^\/user\/([^/]+)(?:\/(.*))?$/);
+        if (m) return { kind: "user", id: "/user/" + m[1], hasExtra: !!(m[2] && m[2].length) };
+
+        // Not a supported channel reference.
+        return null;
+    } catch {
+        // Parsing error treated as non-channel ref.
+        return null;
+    }
 }
 
+/*
+    Function: isChannelHref
+
+    Purpose
+    Quick gate to check if an anchor's href looks like a channel reference.
+
+    Inputs
+    - a: HTMLAnchorElement
+
+    Outputs
+    - boolean
+*/
+function isChannelHref(a) {
+    // Delegate to the parser and coerce to boolean.
+    const info = parseChannelRefFromHref(a.getAttribute("href") || "");
+    return !!info;
+}
+
+/*
+    Function: isChannelNameAnchor
+
+    Purpose
+    Determine if an anchor represents a channel-name text link pointing to the channel ROOT.
+
+    Inputs
+    - a: HTMLAnchorElement
+
+    Outputs
+    - boolean
+*/
 function isChannelNameAnchor(a) {
+    // Require a recognizable channel reference.
     if (!isChannelHref(a)) return false;
+
+    // Exclude anchors wrapping images/avatars; only text names should get the icon.
     try {
         if (a.querySelector("img, yt-img-shadow")) return false;
     } catch {}
+
+    // Exclude anchors in known containers (subscribe buttons, tabs, shelf titles).
     for (const sel of EXCLUDE_CONTAINERS) {
         if (closestDeep(a, sel)) return false;
     }
+
+    // Exclude anchors whose visible text is subscribe-related.
     const txt = (a.textContent || "").trim();
     if (EXCLUDE_TEXT_REGEX.test(txt)) return false;
+
+    // Exclude channel page navigation tabs by role.
+    const role = (a.getAttribute("role") || "").toLowerCase();
+    if (role === "tab") return false;
+
+    // Accept only ROOT links; reject if there are trailing segments like /videos.
+    const info = parseChannelRefFromHref(a.getAttribute("href") || "");
+    if (!info || info.hasExtra) return false;
+
+    // On video pages, only accept the dedicated #channel-name link.
     const inOwner = !!closestDeep(a, "ytd-video-owner-renderer");
     if (inOwner && !closestDeep(a, "ytd-video-owner-renderer #channel-name")) return false;
+
+    // Passed all gates.
     return true;
 }
 
 /*
-    Section: Reference Extraction
+    Function: extractRef
 
     Purpose
-    Extract a robust reference token to send to background. Handles UC ids, @handles, /c names, /user names, and full URLs.
+    Produce a robust reference token for background checks, preferring UC or handle, else path.
 
-    Parameters
-    a: HTMLAnchorElement
+    Inputs
+    - a: HTMLAnchorElement
 
-    Returns
-    string | null
+    Outputs
+    - string | null reference token
 */
 function extractRef(a) {
+    // Read raw href and use parsed info when possible for consistency.
     try {
         const raw = (a.getAttribute("href") || "").trim();
         if (!raw) return null;
+
+        const info = parseChannelRefFromHref(raw);
+        if (info) {
+            if (info.kind === "uc") return info.id;
+            if (info.kind === "handle") return info.id;
+            return raw.startsWith("/") ? raw : new URL(raw, location.href).pathname;
+        }
+
+        // Fallback patterns for robustness in edge cases.
         const mUC = raw.match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
         if (mUC) return mUC[1];
         const mAt = raw.match(/\/@([^/?#]+)/);
         if (mAt) return "@" + decodeURIComponent(mAt[1].toLowerCase());
-        if (raw.startsWith("/c/") || raw.startsWith("/user/")) return raw;
+
+        // If absolute URL, check for youtube host-specific forms.
         if (/^https?:\/\//i.test(raw)) {
             try {
                 const u = new URL(raw);
@@ -274,31 +405,36 @@ function extractRef(a) {
             } catch {}
             return raw;
         }
+
+        // Resolve relative paths as a last resort.
         try {
-            const abs = new URL(raw, location.href).toString();
-            return abs;
+            return new URL(raw, location.href).toString();
         } catch {
             return raw;
         }
     } catch {
+        // Extraction failure yields null.
         return null;
     }
 }
 
 /*
-    Section: Marker
+    Function: addMarker
 
     Purpose
-    Append one small icon to the anchor to indicate subscription.
+    Append the subscription marker icon image to a channel-name anchor.
 
-    Parameters
-    a: HTMLAnchorElement
+    Inputs
+    - a: HTMLAnchorElement target
 
-    Returns
-    void
+    Outputs
+    - void
 */
 function addMarker(a) {
+    // Avoid duplicate markers on the same anchor.
     if (a.querySelector(".subscription-marker")) return;
+
+    // Create image element and set source from extension assets.
     const img = document.createElement("img");
     try {
         if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
@@ -307,6 +443,8 @@ function addMarker(a) {
             return;
         }
     } catch { return; }
+
+    // Style and annotate the marker, then append.
     img.className = "subscription-marker";
     img.style.marginLeft = "5px";
     img.style.width = "16px";
@@ -317,23 +455,28 @@ function addMarker(a) {
 }
 
 /*
-    Section: Scanner
+    Function: queueRefsFromDom
 
     Purpose
-    Traverse DOM and queue references for anchors that pass gates and lack a marker.
+    Scan the DOM for candidate anchors, gate them, extract references, and queue for bulk checks.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    void
+    Outputs
+    - void
 */
 function queueRefsFromDom() {
+    // Collect potential anchors across light/shadow DOM.
     const anchors = queryAllDeep(document, SELECTOR_LIST);
+
+    // Track counts for heartbeat visibility.
     let seen = 0;
     let eligible = 0;
     let extracted = 0;
     let added = 0;
+
+    // Gate and queue each anchor reference for background checks.
     for (const a of anchors) {
         seen += 1;
         if (!isChannelNameAnchor(a)) continue;
@@ -345,35 +488,44 @@ function queueRefsFromDom() {
         pendingRefs.add(ref);
         added += 1;
     }
+
+    // Emit a periodic scan summary.
     logger.heartbeat("scan", () => ["scan", "anchors", seen, "eligible", eligible, "extracted", extracted, "queued", added, "pending", pendingRefs.size]);
+
+    // If the bulk interval has elapsed, trigger a flush.
     if (pendingRefs.size && Date.now() - lastBulkAt >= BULK_INTERVAL_MS) {
         void flushBulk();
     }
 }
 
 /*
-    Section: Batch Apply
+    Function: flushBulk
 
     Purpose
-    Send a batch to background, then mark passing anchors.
+    Send a batch of pending references to the background and append markers for positive results.
 
-    Parameters
-    none
+    Inputs
+    - None
 
-    Returns
-    Promise<void>
+    Outputs
+    - Promise<void>
 */
 async function flushBulk() {
+    // Respect interval and skip when nothing is queued.
     if (!pendingRefs.size) return;
     const now = Date.now();
     if (now - lastBulkAt < BULK_INTERVAL_MS) return;
     lastBulkAt = now;
+
+    // Drain up to MAX_IDS_PER_BULK items into an array.
     const ids = [];
     for (const id of pendingRefs) {
         ids.push(id);
         if (ids.length >= MAX_IDS_PER_BULK) break;
     }
     for (const id of ids) pendingRefs.delete(id);
+
+    // Request results from background script.
     logger.info("bulk request", ids.length);
     let response = null;
     try {
@@ -381,11 +533,15 @@ async function flushBulk() {
     } catch {
         response = null;
     }
+
+    // On failure, requeue to try again later.
     if (!response || !response.results) {
         logger.warn("bulk response missing; requeueing", ids.length);
         for (const id of ids) pendingRefs.add(id);
         return;
     }
+
+    // Re-scan current DOM snapshot and mark passing anchors.
     const results = response.results;
     const anchors = queryAllDeep(document, SELECTOR_LIST);
     let marked = 0;
@@ -399,162 +555,157 @@ async function flushBulk() {
             marked += 1;
         }
     }
+
+    // Log how many markers were added this pass.
     if (marked > 0) logger.info("markers added", marked);
+
+    // If work remains, schedule another flush.
     if (pendingRefs.size) {
         setTimeout(flushBulk, BULK_INTERVAL_MS);
     }
 }
 
 /*
-    Section: Debug Bridge
+    Code Block: Debug Bridges (Resolve / Identity / Account / Invalidate)
 
     Purpose
-    Allow page-world scripts and the DevTools console to request a one-off resolve test without direct access to chrome.runtime.
+    Expose optional test hooks via window.postMessage. Gated behind DEBUG to reduce surface area and noise.
 
-    Invocation
-    window.postMessage({ type: "YTSM_DEBUG_RESOLVE", ref: "/@handle" })
+    Inputs
+    - Messages: YTSM_DEBUG_RESOLVE, YTSM_WHOAMI, YTSM_LOGOUT, YTSM_REAUTH, YTSM_INVALIDATE
 
-    Response
-    Posts back a message with type "YTSM_DEBUG_RESULT" carrying { ref, norm, resolvedUc, inIndex, final }
+    Outputs
+    - Matching *_RESULT messages posted back to window
 */
-window.addEventListener("message", evt => {
-    try {
-        const data = evt && evt.data;
-        if (!data) return;
-        if (data.type === "YTSM_DEBUG_RESOLVE") {
-            const ref = String(data.ref || "");
-            safeSendMessage({ type: "debugResolve", ref })
-                .then(result => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", payload: result }, "*"); } catch {} })
-                .catch(err => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
-        }
-    } catch {}
-});
+if (DEBUG) {
+    // Resolve test bridge.
+    window.addEventListener("message", evt => {
+        try {
+            const data = evt && evt.data;
+            if (!data) return;
+            if (data.type === "YTSM_DEBUG_RESOLVE") {
+                const ref = String(data.ref || "");
+                safeSendMessage({ type: "debugResolve", ref })
+                    .then(result => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", payload: result }, "*"); } catch {} })
+                    .catch(err => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+            }
+        } catch {}
+    });
+
+    // Identity bridge.
+    window.addEventListener("message", evt => {
+        try {
+            const data = evt && evt.data;
+            if (!data) return;
+            if (data.type === "YTSM_WHOAMI") {
+                safeSendMessage({ type: "whoami" })
+                    .then(result => { try { window.postMessage({ type: "YTSM_WHOAMI_RESULT", payload: result }, "*"); } catch {} })
+                    .catch(err => { try { window.postMessage({ type: "YTSM_WHOAMI_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+            }
+        } catch {}
+    });
+
+    // Account control bridges (logout, reauth).
+    window.addEventListener("message", evt => {
+        try {
+            const data = evt && evt.data;
+            if (!data) return;
+            if (data.type === "YTSM_LOGOUT") {
+                safeSendMessage({ type: "logout" })
+                    .then(result => { try { window.postMessage({ type: "YTSM_LOGOUT_RESULT", payload: result }, "*"); } catch {} })
+                    .catch(err => { try { window.postMessage({ type: "YTSM_LOGOUT_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+            }
+            if (data.type === "YTSM_REAUTH") {
+                safeSendMessage({ type: "reauth" })
+                    .then(result => { try { window.postMessage({ type: "YTSM_REAUTH_RESULT", payload: result }, "*"); } catch {} })
+                    .catch(err => { try { window.postMessage({ type: "YTSM_REAUTH_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
+            }
+        } catch {}
+    });
+
+    // Invalidate handle/url cache bridge.
+    window.addEventListener("message", evt => {
+        try {
+            const d = evt && evt.data;
+            if (!d || d.type !== "YTSM_INVALIDATE") return;
+            const ref = String(d.ref || "");
+            const key = ref.startsWith("@") || ref.startsWith("/") ? ref : "@" + ref;
+            safeSendMessage({ type: "invalidateHandle", handle: key })
+                .then(r => { try { window.postMessage({ type: "YTSM_INVALIDATE_RESULT", payload: r }, "*"); } catch {} })
+                .catch(e => { try { window.postMessage({ type: "YTSM_INVALIDATE_RESULT", error: e && e.message ? e.message : String(e) }, "*"); } catch {} });
+        } catch {}
+    });
+}
 
 /*
-    Section: Debug Identity Bridge
+    Function: start
 
     Purpose
-    Request the current authenticated YouTube channel identity and echo it back to the page console.
+    Begin observing mutations and periodic scans, and trigger an initial background refresh.
 
-    Invocation
-    window.postMessage({ type: "YTSM_WHOAMI" })
+    Inputs
+    - None
 
-    Response
-    YTSM_WHOAMI_RESULT with { ok, identity }
-*/
-window.addEventListener("message", evt => {
-    try {
-        const data = evt && evt.data;
-        if (!data) return;
-        if (data.type === "YTSM_WHOAMI") {
-            safeSendMessage({ type: "whoami" })
-                .then(result => { try { window.postMessage({ type: "YTSM_WHOAMI_RESULT", payload: result }, "*"); } catch {} })
-                .catch(err => { try { window.postMessage({ type: "YTSM_WHOAMI_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
-        }
-    } catch {}
-});
-
-/*
-    Section: Debug Account Control
-
-    Purpose
-    Allow logging out and reauth from the page console.
-
-    Invocations
-    window.postMessage({ type: "YTSM_LOGOUT" })
-    window.postMessage({ type: "YTSM_REAUTH" })
-
-    Responses
-    YTSM_LOGOUT_RESULT with { ok }
-    YTSM_REAUTH_RESULT with { ok, total }
-*/
-window.addEventListener("message", evt => {
-    try {
-        const data = evt && evt.data;
-        if (!data) return;
-        if (data.type === "YTSM_LOGOUT") {
-            safeSendMessage({ type: "logout" })
-                .then(result => { try { window.postMessage({ type: "YTSM_LOGOUT_RESULT", payload: result }, "*"); } catch {} })
-                .catch(err => { try { window.postMessage({ type: "YTSM_LOGOUT_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
-        }
-        if (data.type === "YTSM_REAUTH") {
-            safeSendMessage({ type: "reauth" })
-                .then(result => { try { window.postMessage({ type: "YTSM_REAUTH_RESULT", payload: result }, "*"); } catch {} })
-                .catch(err => { try { window.postMessage({ type: "YTSM_REAUTH_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
-        }
-    } catch {}
-});
-
-/*
-    Section: Debug Invalidate Bridge
-
-    Purpose
-    Allow page-world to invalidate a cached handle/url mapping in the background so the next check re-resolves.
-
-    Invocation
-    window.postMessage({ type: "YTSM_INVALIDATE", ref: "@handle" })
-
-    Response
-    YTSM_INVALIDATE_RESULT with { ok }
-*/
-window.addEventListener("message", evt => {
-    try {
-        const d = evt && evt.data;
-        if (!d || d.type !== "YTSM_INVALIDATE") return;
-        const ref = String(d.ref || "");
-        const key = ref.startsWith("@") || ref.startsWith("/") ? ref : "@" + ref;
-        safeSendMessage({ type: "invalidateHandle", handle: key })
-            .then(r => { try { window.postMessage({ type: "YTSM_INVALIDATE_RESULT", payload: r }, "*"); } catch {} })
-            .catch(e => { try { window.postMessage({ type: "YTSM_INVALIDATE_RESULT", error: e && e.message ? e.message : String(e) }, "*"); } catch {} });
-    } catch {}
-});
-
-/*
-    Section: Hotkey
-
-    Purpose
-    Provide a quick way to test a reference without using the console.
-
-    Hotkey
-    Alt + Shift + Y
-*/
-document.addEventListener("keydown", e => {
-    try {
-        if (e.altKey && e.shiftKey && e.key && e.key.toLowerCase() === "y") {
-            const ref = prompt("YTSM debugResolve: enter channel ref (@handle, /channel/UC..., /c/..., /user/..., or URL):", "/@dttodot");
-            if (!ref) return;
-            safeSendMessage({ type: "debugResolve", ref })
-                .then(result => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", payload: result }, "*"); } catch {} })
-                .catch(err => { try { window.postMessage({ type: "YTSM_DEBUG_RESULT", error: err && err.message ? err.message : String(err) }, "*"); } catch {} });
-        }
-    } catch {}
-});
-
-/*
-    Section: Lifecycle
-
-    Purpose
-    Start DOM observation and periodic scans. Stop on pagehide and when tab is hidden.
+    Outputs
+    - void
 */
 function start() {
+    // Ensure clean state by stopping any prior observers/timers.
     stop();
+
+    // Observe DOM mutations and schedule scans on microtasks.
     observer = new MutationObserver(() => {
         queueMicrotask(queueRefsFromDom);
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    // Periodic scan to catch changes missed by mutations.
     pollTimer = setInterval(queueRefsFromDom, 1500);
+
+    // Initial scan and early bulk flush.
     queueRefsFromDom();
     lastBulkAt = 0;
     setTimeout(() => void flushBulk(), 100);
+
+    // Opportunistic subscriptions refresh.
     void safeSendMessage({ type: "refreshSubscriptions" });
 }
 
+/*
+    Function: stop
+
+    Purpose
+    Disconnect observers and timers, and clear any pending queue.
+
+    Inputs
+    - None
+
+    Outputs
+    - void
+*/
 function stop() {
+    // Disconnect mutation observer.
     if (observer) { observer.disconnect(); observer = null; }
+
+    // Clear periodic polling timer.
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+
+    // Empty any queued references.
     pendingRefs.clear();
 }
 
+/*
+    Code Block: Lifecycle Hooks
+
+    Purpose
+    Tie start/stop to page and tab visibility lifecycle to avoid wasted work.
+
+    Inputs
+    - pagehide, beforeunload, visibilitychange events
+
+    Outputs
+    - None
+*/
 window.addEventListener("pagehide", stop, { capture: true });
 window.addEventListener("beforeunload", stop, { capture: true });
 document.addEventListener("visibilitychange", () => {
@@ -565,4 +716,16 @@ document.addEventListener("visibilitychange", () => {
     }
 });
 
+/*
+    Code Block: Script Entry
+
+    Purpose
+    Kick off the content script logic.
+
+    Inputs
+    - None
+
+    Outputs
+    - None
+*/
 start();
